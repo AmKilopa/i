@@ -1,10 +1,12 @@
 #Requires -RunAsAdministrator
 $ErrorActionPreference = 'SilentlyContinue'
 
-function Write-Ok($m)   { Write-Host '  [' -NoNewline; Write-Host 'OK'    -ForegroundColor Green  -NoNewline; Write-Host "] $m" }
-function Write-Info($m) { Write-Host '  [' -NoNewline; Write-Host 'INFO'  -ForegroundColor Cyan   -NoNewline; Write-Host "] $m" }
-function Write-Warn($m) { Write-Host '  [' -NoNewline; Write-Host 'WARN'  -ForegroundColor Yellow -NoNewline; Write-Host "] $m" }
-function Write-Err($m)  { Write-Host '  [' -NoNewline; Write-Host 'ERROR' -ForegroundColor Red    -NoNewline; Write-Host "] $m" }
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+function Write-Ok($m)   { Write-Host '  [' -NoNewline; Write-Host 'OK' -ForegroundColor Green -NoNewline; Write-Host "] $m" }
+function Write-Info($m) { Write-Host '  [' -NoNewline; Write-Host 'INFO' -ForegroundColor Cyan -NoNewline; Write-Host "] $m" }
+function Write-Warn($m) { Write-Host '  [' -NoNewline; Write-Host 'WARN' -ForegroundColor Yellow -NoNewline; Write-Host "] $m" }
 
 function Refresh-Path {
     $m = [System.Environment]::GetEnvironmentVariable('PATH','Machine')
@@ -13,164 +15,153 @@ function Refresh-Path {
 }
 
 function Download-File($Url, $Dest, $Label) {
-    Write-Host ''
-    $wc = New-Object System.Net.WebClient
-    $wc.Headers.Add('User-Agent','Mozilla/5.0')
-    Register-ObjectEvent -InputObject $wc -EventName DownloadProgressChanged -SourceIdentifier 'DLP' -Action {
-        $p = $Event.SourceArgs[1].ProgressPercentage
-        $r = [math]::Round($Event.SourceArgs[1].BytesReceived/1MB,2)
-        $t = [math]::Round($Event.SourceArgs[1].TotalBytesToReceive/1MB,2)
-        $b = '#' * [math]::Floor($p/5)
-        $s = ' ' * (20 - [math]::Floor($p/5))
-        [Console]::Write("`r [$b$s] $p% ($r MB / $t MB)  ")
-    } | Out-Null
+    $wc = $null
     try {
-        $task = $wc.DownloadFileTaskAsync($Url, $Dest)
-        while (-not $task.IsCompleted) { Start-Sleep -Milliseconds 150 }
-        Write-Host ''
-        if ($task.IsFaulted) { throw $task.Exception.InnerException }
-        Write-Ok "$Label - downloaded!"
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add('User-Agent','Mozilla/5.0')
+        $wc.DownloadFile($Url, $Dest)
+        Write-Ok "$Label"
     } catch {
-        Write-Host ''
-        Write-Err "Failed to download $Label : $_"
+        Write-Warn "$Label : $_"
     } finally {
-        Unregister-Event -SourceIdentifier 'DLP' -ErrorAction SilentlyContinue
-        $wc.Dispose()
+        if ($wc) { $wc.Dispose() }
     }
 }
 
 function Install-Winget($id, $label) {
-    Write-Host "  Installing $label ..." -ForegroundColor Gray
+    Write-Host "  $label" -ForegroundColor Gray
     winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) {
-        Write-Ok "$label - done"
-    } else {
-        Write-Warn "$label - already installed or error (code $LASTEXITCODE)"
-    }
-    Write-Host ''
+    if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) { Write-Ok $label } else { Write-Warn $label }
 }
 
+$boxW = 50
+$boxTop = "  +" + ("=" * $boxW) + "+"
+$boxLn = "  |" + ("  Setup: D: drive only, no C: clutter".PadRight($boxW)) + "|"
 Clear-Host
 Write-Host ''
-Write-Host '  +==================================================+' -ForegroundColor Cyan
-Write-Host '  |       Installing programs on clean Windows       |' -ForegroundColor Cyan
-Write-Host '  +==================================================+' -ForegroundColor Cyan
+Write-Host $boxTop -ForegroundColor Cyan
+Write-Host $boxLn -ForegroundColor Cyan
+Write-Host $boxTop -ForegroundColor Cyan
 Write-Host ''
 
-Write-Host '  Enter base folder path [Enter = D:\]: ' -ForegroundColor Yellow -NoNewline
+Write-Host '  Base [Enter = D:\]: ' -ForegroundColor Yellow -NoNewline
 $inputPath = Read-Host
 if ([string]::IsNullOrWhiteSpace($inputPath)) { $inputPath = 'D:\' }
 $BASE = $inputPath.TrimEnd('\')
-Write-Host ''
-Write-Info "Base folder: $BASE"
-Write-Host ''
-Write-Host '  --------------------------------------------------' -ForegroundColor DarkGray
+Write-Info "Base: $BASE"
 Write-Host ''
 
-Write-Host '  [FOLDERS] Creating folder structure...' -ForegroundColor Cyan
-Write-Host ''
-foreach ($f in @('Download','Project','Program','Games')) {
+Write-Host '  Folders...' -ForegroundColor Cyan
+foreach ($f in @('Download','Project','Program','Games','Discord')) {
     $p = "$BASE\$f"
     if (-not (Test-Path $p)) {
         New-Item -ItemType Directory -Path $p -Force | Out-Null
-        Write-Host '  [' -NoNewline; Write-Host '+' -ForegroundColor Green -NoNewline; Write-Host "] Created: $p"
+        Write-Host '  ' -NoNewline; Write-Host '+' -ForegroundColor Green -NoNewline; Write-Host " $p"
     } else {
-        Write-Host '  [' -NoNewline; Write-Host '~' -ForegroundColor DarkYellow -NoNewline; Write-Host "] Already exists: $p"
+        Write-Host '  ' -NoNewline; Write-Host '~' -ForegroundColor DarkGray -NoNewline; Write-Host " $p"
     }
 }
 Write-Host ''
-Write-Host '  --------------------------------------------------' -ForegroundColor DarkGray
-Write-Host ''
 
-Write-Host '  [CHOCO] Checking Chocolatey...' -ForegroundColor Cyan
+$chocoPath = "$BASE\Chocolatey"
+if (-not (Test-Path $chocoPath)) { New-Item -ItemType Directory -Path $chocoPath -Force | Out-Null }
+[System.Environment]::SetEnvironmentVariable('ChocolateyInstall', $chocoPath, 'Machine')
+$env:ChocolateyInstall = $chocoPath
+
+Write-Host '  Chocolatey...' -ForegroundColor Cyan
 if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-    Write-Info 'Installing Chocolatey...'
-    Set-ExecutionPolicy Bypass -Scope Process -Force
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-    Refresh-Path
-    if (Get-Command choco -ErrorAction SilentlyContinue) { Write-Ok 'Chocolatey installed!' }
-    else { Write-Warn 'Chocolatey could not be installed. Continuing...' }
+    try {
+        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        Refresh-Path
+        $env:Path = "$chocoPath\bin;$env:Path"
+        if (Get-Command choco -ErrorAction SilentlyContinue) { Write-Ok 'Chocolatey' } else { Write-Warn 'Chocolatey' }
+    } catch { Write-Warn "Chocolatey: $_" }
 } else {
-    $v = choco --version 2>$null
-    Write-Ok "Chocolatey already installed. Version: $v"
+    Write-Ok 'Chocolatey'
 }
-Write-Host ''
-Write-Host '  --------------------------------------------------' -ForegroundColor DarkGray
 Write-Host ''
 
-Write-Host '  [ZAPRET] Downloading zapret-discord-youtube...' -ForegroundColor Cyan
-$zDir  = 'C:\Discord'
-$zFile = 'C:\Discord\zapret-discord-youtube-1.9.7b.rar'
-$zUrl  = 'https://github.com/Flowseal/zapret-discord-youtube/releases/download/1.9.7b/zapret-discord-youtube-1.9.7b.rar'
-if (-not (Test-Path $zDir)) {
-    New-Item -ItemType Directory -Path $zDir -Force | Out-Null
-    Write-Ok 'Folder C:\Discord created'
-} else {
-    Write-Host '  [~] C:\Discord already exists' -ForegroundColor DarkYellow
-}
-if (Test-Path $zFile) {
-    Write-Ok "Zapret already downloaded: $zFile"
-} else {
-    Write-Info "Source: $zUrl"
+$zDir = "$BASE\Discord"
+$zFile = "$zDir\zapret-discord-youtube-1.9.7b.rar"
+$zUrl = 'https://github.com/Flowseal/zapret-discord-youtube/releases/download/1.9.7b/zapret-discord-youtube-1.9.7b.rar'
+
+Write-Host '  Zapret...' -ForegroundColor Cyan
+if (Test-Path $zFile) { Write-Ok 'Zapret' } else {
     Download-File -Url $zUrl -Dest $zFile -Label 'Zapret'
 }
 Write-Host ''
-Write-Host '  --------------------------------------------------' -ForegroundColor DarkGray
-Write-Host ''
 
+Write-Host '  winget...' -ForegroundColor Cyan
 if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Err 'winget not found. Install App Installer from Microsoft Store.'
-    Read-Host 'Press Enter to exit'
-    exit 1
+    Write-Warn 'winget not found'
+    $r = Read-Host '  Continue? (y/n)'
+    if ($r -ne 'y') { exit 1 }
+} else {
+    Write-Ok 'winget'
+    winget source update 2>&1 | Out-Null
 }
-Write-Info 'Starting program installation...'
 Write-Host ''
-Install-Winget 'Python.Python.3.12'              'Python 3.12        [1/7]'
-Install-Winget 'Opera.OperaGX'                   'Opera GX           [2/7]'
-Install-Winget 'OpenJS.NodeJS.LTS'               'Node.js 22 LTS     [3/7]'
-Install-Winget 'EclipseAdoptium.Temurin.21.JDK'  'Java JDK 21        [4/7]'
-Install-Winget 'Anysphere.Cursor'                'Cursor             [5/7]'
-Install-Winget 'Discord.Discord'                 'Discord            [6/7]'
-Install-Winget 'Git.Git'                         'Git                [7/7]'
 
-Write-Info 'Refreshing PATH...'
+Write-Host '  Programs...' -ForegroundColor Cyan
+if (Get-Command winget -ErrorAction SilentlyContinue) {
+    Install-Winget 'Python.Python.3.12' 'Python'
+    Install-Winget 'Opera.OperaGX' 'Opera GX'
+    Install-Winget 'OpenJS.NodeJS.LTS' 'Node.js'
+    Install-Winget 'Anysphere.Cursor' 'Cursor'
+    Install-Winget 'Discord.Discord' 'Discord'
+    Install-Winget 'Git.Git' 'Git'
+}
+Write-Host ''
+
+Write-Host '  Rust...' -ForegroundColor Cyan
+$rustDir = "$BASE\Rust"
+$rustupPath = "$rustDir\.rustup"
+$cargoPath = "$rustDir\.cargo"
+$rustupExe = "$BASE\Download\rustup-init.exe"
+
+if (Get-Command rustc -ErrorAction SilentlyContinue) {
+    Write-Ok 'Rust'
+} else {
+    if (-not (Test-Path $rustDir)) { New-Item -ItemType Directory -Path $rustDir -Force | Out-Null }
+    if (-not (Test-Path "$BASE\Download")) { New-Item -ItemType Directory -Path "$BASE\Download" -Force | Out-Null }
+    if (-not (Test-Path $rustupExe)) {
+        Download-File -Url 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -Dest $rustupExe -Label 'rustup-init'
+    }
+    if (Test-Path $rustupExe) {
+        $env:RUSTUP_HOME = $rustupPath
+        $env:CARGO_HOME = $cargoPath
+        [System.Environment]::SetEnvironmentVariable('RUSTUP_HOME', $rustupPath, 'Machine')
+        [System.Environment]::SetEnvironmentVariable('CARGO_HOME', $cargoPath, 'Machine')
+        [System.Environment]::SetEnvironmentVariable('PATH', "$cargoPath\bin;" + [System.Environment]::GetEnvironmentVariable('PATH','Machine'), 'Machine')
+        try {
+            Start-Process -FilePath $rustupExe -ArgumentList '-y' -Wait -NoNewWindow
+            Refresh-Path
+            $env:PATH = "$cargoPath\bin;$env:PATH"
+            if (Get-Command rustc -ErrorAction SilentlyContinue) { Write-Ok 'Rust' } else { Write-Warn 'Rust' }
+        } catch { Write-Warn "Rust: $_" }
+    }
+}
+Write-Host ''
+
+Write-Host '  Spotify...' -ForegroundColor Cyan
+if (Get-Command choco -ErrorAction SilentlyContinue) {
+    choco install spotify -y 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Ok 'Spotify' } else { Write-Warn 'Spotify' }
+} else { Write-Warn 'Spotify' }
+Write-Host ''
+
+Write-Host '  npm...' -ForegroundColor Cyan
 Refresh-Path
-Write-Ok 'PATH refreshed'
-Write-Host ''
-
-Write-Host '  [npm] Installing pnpm...' -ForegroundColor Cyan
 if (Get-Command npm -ErrorAction SilentlyContinue) {
     npm install -g pnpm 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Ok 'pnpm installed!' } else { Write-Warn "pnpm error (code $LASTEXITCODE)" }
-} else {
-    Write-Warn 'npm not found. After reboot run: npm install -g pnpm'
-}
-Write-Host ''
-
-Write-Host '  [npm] Installing klpgit...' -ForegroundColor Cyan
-if (Get-Command npm -ErrorAction SilentlyContinue) {
+    if (Get-Command pnpm -ErrorAction SilentlyContinue) { Write-Ok 'pnpm' } else { Write-Warn 'pnpm' }
     npm install -g klpgit 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Ok 'klpgit installed!' } else { Write-Warn "klpgit error (code $LASTEXITCODE)" }
-} else {
-    Write-Warn 'npm not found. After reboot run: npm install -g klpgit'
-}
-Write-Host ''
-Write-Host '  --------------------------------------------------' -ForegroundColor DarkGray
+    if (Get-Command klpgit -ErrorAction SilentlyContinue) { Write-Ok 'klpgit' } else { Write-Warn 'klpgit' }
+} else { Write-Warn 'npm' }
 Write-Host ''
 
-Write-Host '  +==================================================+' -ForegroundColor Green
-Write-Host '  |              Installation complete!              |' -ForegroundColor Green
-Write-Host '  +==================================================+' -ForegroundColor Green
+Write-Host $boxTop -ForegroundColor Green
+Write-Host ("  |" + ("  Done.".PadRight($boxW)) + "|") -ForegroundColor Green
+Write-Host $boxTop -ForegroundColor Green
 Write-Host ''
-Write-Host "  Folders in $BASE :" -ForegroundColor White
-Write-Host '    Download / Project / Program / Games' -ForegroundColor Gray
-Write-Host ''
-Write-Host '  Zapret: C:\Discord\zapret-discord-youtube-1.9.7b.rar' -ForegroundColor Gray
-Write-Host ''
-Write-Host '  Installed:' -ForegroundColor White
-foreach ($item in @('Chocolatey','Python 3.12','Opera GX','Node.js 22 LTS','Java JDK 21','Cursor','Discord','Git','pnpm','klpgit')) {
-    Write-Host "    v $item" -ForegroundColor Green
-}
-Write-Host ''
-Read-Host '  Press Enter to exit'
+Read-Host '  Enter to exit'
