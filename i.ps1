@@ -30,8 +30,8 @@ function Download-File($Url, $Dest, $Label) {
 
 function Install-Winget($id, $label) {
     Write-Host "  $label" -ForegroundColor Gray
-    winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) { Write-Ok $label } else { Write-Warn $label }
+    winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) { Write-Ok $label } else { Write-Warn "$label (Код: $LASTEXITCODE)" }
 }
 
 $boxW = 50
@@ -79,13 +79,18 @@ $tgProxyDir = "$BASE\Telegram"
 try {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/Flowseal/tg-ws-proxy/releases/latest"
     if ($release.assets.Count -gt 0) {
-        $asset = $release.assets[0]
-        $proxyUrl = $asset.browser_download_url
-        $proxyDest = "$tgProxyDir\$($asset.name)"
-        if (-not (Test-Path $proxyDest)) {
-            Download-File -Url $proxyUrl -Dest $proxyDest -Label "tg-ws-proxy ($($asset.name))"
+        $asset = $release.assets | Where-Object { $_.name -match 'windows|win' -or $_.name -match '\.exe$' } | Select-Object -First 1
+        
+        if ($asset) {
+            $proxyUrl = $asset.browser_download_url
+            $proxyDest = "$tgProxyDir\$($asset.name)"
+            if (-not (Test-Path $proxyDest)) {
+                Download-File -Url $proxyUrl -Dest $proxyDest -Label "tg-ws-proxy ($($asset.name))"
+            } else {
+                Write-Ok 'tg-ws-proxy already downloaded'
+            }
         } else {
-            Write-Ok 'tg-ws-proxy already downloaded'
+            Write-Warn 'tg-ws-proxy: Windows asset not found in release'
         }
     } else {
         Write-Warn 'tg-ws-proxy: No assets found in the latest release'
@@ -112,18 +117,23 @@ Write-Ok 'Confirmation received, continuing...'
 Write-Host ''
 
 $chocoPath = "$BASE\Chocolatey"
-if (-not (Test-Path $chocoPath)) { New-Item -ItemType Directory -Path $chocoPath -Force | Out-Null }
 [System.Environment]::SetEnvironmentVariable('ChocolateyInstall', $chocoPath, 'Machine')
 $env:ChocolateyInstall = $chocoPath
 
 Write-Host '  Chocolatey...' -ForegroundColor Cyan
 if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-    try {
-        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-        Refresh-Path
+    if (Test-Path "$chocoPath\bin\choco.exe") {
         $env:Path = "$chocoPath\bin;$env:Path"
-        if (Get-Command choco -ErrorAction SilentlyContinue) { Write-Ok 'Chocolatey' } else { Write-Warn 'Chocolatey' }
-    } catch { Write-Warn "Chocolatey: $_" }
+        Write-Ok 'Chocolatey (Recovered)'
+    } else {
+        if (Test-Path $chocoPath) { Remove-Item -Path $chocoPath -Recurse -Force -ErrorAction SilentlyContinue }
+        try {
+            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            Refresh-Path
+            $env:Path = "$chocoPath\bin;$env:Path"
+            if (Get-Command choco -ErrorAction SilentlyContinue) { Write-Ok 'Chocolatey' } else { Write-Warn 'Chocolatey' }
+        } catch { Write-Warn "Chocolatey: $_" }
+    }
 } else {
     Write-Ok 'Chocolatey'
 }
