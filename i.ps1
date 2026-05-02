@@ -30,8 +30,8 @@ function Download-File($Url, $Dest, $Label) {
 
 function Install-Winget($id, $label) {
     Write-Host "  $label" -ForegroundColor Gray
-    winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements
-    if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) { Write-Ok $label } else { Write-Warn "$label (Код: $LASTEXITCODE)" }
+    winget install --id $id --exact --source winget --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) { Write-Ok $label } else { Write-Warn "$label (Code: $LASTEXITCODE)" }
 }
 
 $boxW = 50
