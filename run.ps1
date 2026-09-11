@@ -4,7 +4,8 @@ param(
     [switch]$Automatic,
     [string]$BasePath = 'D:\',
     [switch]$PlanOnly,
-    [switch]$SkipApplications
+    [switch]$SkipApplications,
+    [switch]$ElevatedChild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +14,9 @@ $ErrorActionPreference = 'Stop'
 trap {
     Write-Host ''
     Write-Host "KlpInstall: $($_.Exception.Message)" -ForegroundColor Red
+    if ($ElevatedChild) {
+        Read-Host 'Press Enter to close this administrator window' | Out-Null
+    }
     exit 1
 }
 
@@ -22,9 +26,9 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function ConvertTo-QuotedArgument {
+function ConvertTo-PowerShellLiteral {
     param([string]$Value)
-    return '"' + $Value.Replace('"', '\"') + '"'
+    return "'" + $Value.Replace("'", "''") + "'"
 }
 
 function Invoke-DownloadFile {
@@ -58,19 +62,36 @@ if ($dataRoot.TrimEnd('\') -ieq $systemRoot.TrimEnd('\')) { throw "The target ca
 if (-not (Test-Path -LiteralPath $dataRoot -PathType Container)) { throw "Drive $dataRoot is unavailable" }
 
 if (-not $PlanOnly -and -not (Test-IsAdministrator)) {
+    # Start-Process joins ArgumentList into one Windows command line. Building quoted
+    # path arguments by hand breaks values such as D:\ because the trailing slash
+    # sits next to a closing quote. Encode the PowerShell command instead so paths,
+    # spaces, apostrophes and trailing backslashes survive UAC elevation unchanged.
+    $commandParts = @(
+        '&',
+        (ConvertTo-PowerShellLiteral $PSCommandPath),
+        '-BasePath',
+        (ConvertTo-PowerShellLiteral $base),
+        '-ElevatedChild'
+    )
+    if ($Automatic) { $commandParts += '-Automatic' }
+    if ($SkipApplications) { $commandParts += '-SkipApplications' }
+
+    $elevatedCommand = $commandParts -join ' '
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($elevatedCommand))
     $elevationArguments = @(
         '-NoLogo',
         '-NoProfile',
         '-ExecutionPolicy',
         'Bypass',
-        '-File',
-        (ConvertTo-QuotedArgument $PSCommandPath),
-        '-BasePath',
-        (ConvertTo-QuotedArgument $base)
+        '-EncodedCommand',
+        $encodedCommand
     )
-    if ($Automatic) { $elevationArguments += '-Automatic' }
-    if ($SkipApplications) { $elevationArguments += '-SkipApplications' }
-    $process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ($elevationArguments -join ' ') -Wait -PassThru
+
+    $process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $elevationArguments -Wait -PassThru
+    if ($process.ExitCode -ne 0) {
+        Write-Host ''
+        Write-Host "KlpInstall failed in the administrator window with exit code $($process.ExitCode)." -ForegroundColor Red
+    }
     exit $process.ExitCode
 }
 
@@ -98,4 +119,12 @@ if ($Automatic) { $arguments += @('-Silent', '-SkipConfirm') }
 if ($PlanOnly) { $arguments += '-PlanOnly' }
 if ($SkipApplications) { $arguments += '-SkipApplications' }
 & powershell.exe @arguments
-exit $LASTEXITCODE
+$exitCode = $LASTEXITCODE
+
+if ($ElevatedChild -and $exitCode -ne 0) {
+    Write-Host ''
+    Write-Host "KlpInstall failed with exit code $exitCode." -ForegroundColor Red
+    Read-Host 'Press Enter to close this administrator window' | Out-Null
+}
+
+exit $exitCode
