@@ -13,7 +13,7 @@ jobs:
   validate:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Validate PowerShell and safe plan mode
         shell: powershell
         run: .\tests\Validate-KlpInstall.ps1
