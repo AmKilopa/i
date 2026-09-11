@@ -19,6 +19,8 @@ KlpInstall настраивает чистую 64-разрядную Windows т�
 
 `install.bat` не требует заранее установленных Git, WinGet или PowerShell 7. Он использует встроенный Windows PowerShell 5.1, загружает недостающие файлы из этого репозитория и при необходимости восстанавливает WinGet.
 
+При повышении прав `run.ps1` передаёт параметры через `-EncodedCommand`, поэтому пути к корню диска вроде `D:\` не повреждаются кавычками Windows. Если установка завершается ошибкой в окне администратора, окно остаётся открытым до нажатия Enter, чтобы сообщение можно было прочитать.
+
 ## Что настраивается
 
 - Рабочий стол, Документы, Загрузки, Изображения, Музыка, Видео, Сохранённые игры, Снимки экрана и Плёнка камеры перенаправляются на `D:` через штатный Windows API.
@@ -43,22 +45,22 @@ Edge и Chrome показывают сообщение о том, что час�
 Интерактивный выбор компонентов:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -BasePath D:\
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -BasePath 'D:\.'
 ```
 
 Только настройка папок и Windows, без установки программ:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Automatic -SkipApplications -BasePath D:\
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Automatic -SkipApplications -BasePath 'D:\.'
 ```
 
 Безопасный просмотр плана без изменения компьютера:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Automatic -SkipApplications -PlanOnly -BasePath D:\
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Automatic -SkipApplications -PlanOnly -BasePath 'D:\.'
 ```
 
-Для другого несистемного диска замените `D:\` в команде, например на `E:\`.
+`D:\.` автоматически нормализуется в `D:\` и используется в примерах, чтобы корневой путь не заканчивался обратным слешем непосредственно перед закрывающей кавычкой командной строки. Для другого несистемного диска используйте, например, `E:\.`.
 
 ## После завершения
 
