@@ -1,0 +1,206 @@
+name: Apply KlpInstall UX fix
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/apply-ux-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Improve installer UI and progress
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'i.ps1'
+          $text = Get-Content -LiteralPath $path -Raw
+
+          $text = $text -replace "(?m)^Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force\r?\n", ''
+          $text = $text.Replace("`$ScriptVersion = '4.0.0'", "`$ScriptVersion = '4.1.0'")
+
+          $downloadFunction = @'
+          function Invoke-DownloadFile {
+              param([string]$Uri, [string]$Destination, [int]$TimeoutSec = 180)
+              $parent = Split-Path -Parent $Destination
+              if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+              $partial = "$Destination.partial"
+              $displayName = [System.IO.Path]::GetFileName($Destination)
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                  $previousProgress = $ProgressPreference
+                  try {
+                      Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+                      Write-Info "Downloading $displayName (attempt $attempt/3)..."
+                      $ProgressPreference = 'Continue'
+                      Invoke-WebRequest -Uri $Uri -OutFile $partial -UseBasicParsing -TimeoutSec $TimeoutSec
+                      $ProgressPreference = $previousProgress
+                      if (-not (Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -eq 0) { throw 'The downloaded file is empty' }
+                      Move-Item -LiteralPath $partial -Destination $Destination -Force
+                      $sizeMB = [math]::Round((Get-Item -LiteralPath $Destination).Length / 1MB, 1)
+                      Write-Ok "Downloaded $displayName ($sizeMB MB)"
+                      return
+                  } catch {
+                      $ProgressPreference = $previousProgress
+                      Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+                      Add-Log "Download attempt $attempt failed for ${Uri}: $($_.Exception.Message)"
+                      if ($attempt -eq 3) { throw }
+                      Write-Warn "Download failed; retrying in $($attempt * 2) seconds..."
+                      Start-Sleep -Seconds ($attempt * 2)
+                  }
+              }
+          }
+          '@
+          $pattern = '(?s)function Invoke-DownloadFile \{.*?\r?\n\}\r?\n\r?\nfunction Set-PersistentEnvironment'
+          if ($text -notmatch $pattern) { throw 'Invoke-DownloadFile block not found' }
+          $text = [regex]::Replace($text, $pattern, $downloadFunction + "`r`n`r`nfunction Set-PersistentEnvironment", 1)
+
+          $copyFunction = @'
+          function Copy-KnownFolderContent {
+              param([string]$Source, [string]$Destination)
+              if ([string]::IsNullOrWhiteSpace($Source) -or -not (Test-Path -LiteralPath $Source -PathType Container)) { return $true }
+              if ([System.IO.Path]::GetFullPath($Source).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')) { return $true }
+              Write-Info "Copying files: $Source -> $Destination"
+              Write-Host '       Robocopy progress will be shown below. Large folders can take several minutes.' -ForegroundColor DarkGray
+              & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /XO /R:2 /W:1 /ETA
+              $exitCode = $LASTEXITCODE
+              Add-Log "robocopy exit $exitCode: $Source -> $Destination"
+              if ($exitCode -le 7) {
+                  Write-Ok "Copy finished: $Destination"
+                  return $true
+              }
+              Write-Fail "Copy failed with robocopy exit code $exitCode"
+              return $false
+          }
+          '@
+          $pattern = '(?s)function Copy-KnownFolderContent \{.*?\r?\n\}\r?\n\r?\nfunction Set-KnownFolderLayout'
+          if ($text -notmatch $pattern) { throw 'Copy-KnownFolderContent block not found' }
+          $text = [regex]::Replace($text, $pattern, $copyFunction + "`r`n`r`nfunction Set-KnownFolderLayout", 1)
+
+          $wingetDownload = @'
+          function Download-WingetInstaller {
+              param([string]$Id, [string]$Scope, [string]$Destination)
+              if (-not $WingetCommand) { return $null }
+              New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+              $selectors = @(
+                  @{ Scope = $true; Architecture = $true },
+                  @{ Scope = $false; Architecture = $true },
+                  @{ Scope = $true; Architecture = $false },
+                  @{ Scope = $false; Architecture = $false }
+              )
+              $exitCode = -1
+              foreach ($selector in $selectors) {
+                  $arguments = @('download', '--id', $Id, '--exact', '--source', 'winget')
+                  if ($selector.Scope) { $arguments += @('--scope', $Scope) }
+                  if ($selector.Architecture) { $arguments += @('--architecture', $Architecture) }
+                  $arguments += @('--download-directory', $Destination, '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+                  Write-Info "WinGet download: $Id"
+                  & $WingetCommand @arguments
+                  $exitCode = $LASTEXITCODE
+                  Add-Log "winget download $Id exit code: $exitCode"
+                  if ($exitCode -eq 0) { break }
+                  Write-Warn "WinGet download attempt failed (exit $exitCode); trying a compatible selector..."
+              }
+              if ($exitCode -ne 0) {
+                  Write-Fail "Download failed for $Id (winget exit $exitCode)"
+                  return $null
+              }
+              $installer = Get-ChildItem -LiteralPath $Destination -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.exe', '.msi', '.msix', '.msixbundle') } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              if (-not $installer) {
+                  Write-Fail "Installer file not found for $Id"
+                  return $null
+              }
+              Write-Ok "Downloaded to $($installer.FullName)"
+              return $installer.FullName
+          }
+          '@
+          $pattern = '(?s)function Download-WingetInstaller \{.*?\r?\n\}\r?\n\r?\nfunction Quote-Argument'
+          if ($text -notmatch $pattern) { throw 'Download-WingetInstaller block not found' }
+          $text = [regex]::Replace($text, $pattern, $wingetDownload + "`r`n`r`nfunction Quote-Argument", 1)
+
+          $componentSelection = @'
+          function Select-Components {
+              $selection = [ordered]@{}
+              Write-Section 'Component selection'
+              Write-Host '  Choose what KlpInstall should install or configure.' -ForegroundColor White
+              Write-Host '  The component name is shown before every Y/N question.' -ForegroundColor DarkGray
+
+              $items = @(
+                  @{ Key = 'Python'; Label = 'Python 3.12'; Question = 'Install Python 3.12?'; Default = $true; Application = $true },
+                  @{ Key = 'Firefox'; Label = 'Mozilla Firefox'; Question = 'Install Firefox?'; Default = $true; Application = $true },
+                  @{ Key = 'Node.js'; Label = 'Node.js LTS'; Question = 'Install Node.js LTS?'; Default = $true; Application = $true },
+                  @{ Key = 'VS Code'; Label = 'Visual Studio Code'; Question = 'Install Visual Studio Code?'; Default = $true; Application = $true },
+                  @{ Key = 'Discord'; Label = 'Discord'; Question = 'Install Discord?'; Default = $true; Application = $true },
+                  @{ Key = 'Git'; Label = 'Git'; Question = 'Install Git?'; Default = $true; Application = $true },
+                  @{ Key = 'Telegram'; Label = 'Telegram Desktop'; Question = 'Install Telegram Desktop?'; Default = $true; Application = $true },
+                  @{ Key = 'Chocolatey'; Label = 'Chocolatey'; Question = 'Install Chocolatey?'; Default = $true; Application = $true },
+                  @{ Key = 'Spotify'; Label = 'Spotify'; Question = 'Install Spotify?'; Default = $true; Application = $true },
+                  @{ Key = 'Rust'; Label = 'Rust toolchain (rustup + cargo)'; Question = 'Install Rust?'; Default = $true; Application = $true },
+                  @{ Key = 'npm_tools'; Label = 'pnpm'; Question = 'Install pnpm?'; Default = $true; Application = $true },
+                  @{ Key = 'tg_proxy'; Label = 'tg-ws-proxy'; Question = 'Download tg-ws-proxy?'; Default = $false; Application = $true },
+                  @{ Key = 'KnownFolders'; Label = 'Windows personal folders'; Question = 'Move Desktop, Documents, Downloads, Pictures, Music, Videos and Saved Games to D:?'; Default = $true; Application = $false },
+                  @{ Key = 'DisableOneDrive'; Label = 'OneDrive'; Question = 'Uninstall and permanently block OneDrive?'; Default = $true; Application = $false },
+                  @{ Key = 'BrowserDownloads'; Label = 'Browser storage'; Question = 'Force browser downloads, profiles and caches to D:?'; Default = $true; Application = $false },
+                  @{ Key = 'WindowsStorage'; Label = 'Windows storage'; Question = 'Move the page file to D: and disable hibernation?'; Default = $true; Application = $false }
+              )
+
+              $index = 0
+              foreach ($item in $items) {
+                  $index++
+                  Write-Host ''
+                  Write-Host ("  [{0}/{1}] {2}" -f $index, $items.Count, $item.Label) -ForegroundColor Cyan
+                  if ($SkipApplications -and $item.Application) {
+                      $selection[$item.Key] = $false
+                      Write-Host '       SKIP - application installation disabled' -ForegroundColor DarkGray
+                      continue
+                  }
+                  $selection[$item.Key] = Prompt-YesNo $item.Question $item.Default
+                  $choice = if ($selection[$item.Key]) { 'YES' } else { 'NO' }
+                  $choiceColor = if ($selection[$item.Key]) { 'Green' } else { 'DarkGray' }
+                  Write-Host "       -> $choice" -ForegroundColor $choiceColor
+              }
+
+              if ($selection['DisableOneDrive']) { $selection['KnownFolders'] = $true }
+              if ($selection['Spotify']) { $selection['Chocolatey'] = $true }
+              Write-Host ''
+              Write-Host '  Installation set:' -ForegroundColor Cyan
+              foreach ($name in $selection.Keys) {
+                  $mark = if ($selection[$name]) { '[+]' } else { '[-]' }
+                  $color = if ($selection[$name]) { 'Green' } else { 'DarkGray' }
+                  Write-Host "  $mark $name" -ForegroundColor $color
+              }
+              return $selection
+          }
+          '@
+          $pattern = '(?s)function Select-Components \{.*?\r?\n\}\r?\n\r?\nfunction Show-Plan'
+          if ($text -notmatch $pattern) { throw 'Select-Components block not found' }
+          $text = [regex]::Replace($text, $pattern, $componentSelection + "`r`n`r`nfunction Show-Plan", 1)
+
+          $oldInstall = '    if (-not (Invoke-AppInstaller -Kind $Spec.Installer -InstallerPath $installerPath -Target $target)) { Write-Fail "$Name installer returned an error"; return ''INSTALLER_FAILED'' }'
+          $newInstall = '    Write-Info "Installing $Name to $target..."' + "`r`n" + $oldInstall
+          if (-not $text.Contains($oldInstall)) { throw 'Install-Application call not found' }
+          $text = $text.Replace($oldInstall, $newInstall)
+
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) $path), $text, (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Validate patched installer
+        shell: powershell
+        run: .\tests\Validate-KlpInstall.ps1
+
+      - name: Commit installer improvements
+        shell: pwsh
+        run: |
+          if (-not (git status --porcelain)) {
+            throw 'Patch produced no changes'
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add i.ps1
+          git commit -m 'feat: show clear choices and live installation progress'
+          git push
