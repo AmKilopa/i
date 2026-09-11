@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = 'Stop'
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
-$ScriptVersion = '4.1.0'
+$ScriptVersion = '4.2.0'
 $MinimumFreeSpaceGB = 50
 $Results = [ordered]@{}
 $LogFile = $null
@@ -222,26 +222,6 @@ function Export-RegistryKey {
     return $LASTEXITCODE -eq 0
 }
 
-function Copy-KnownFolderContent {
-    param([string]$Source, [string]$Destination)
-    if ([string]::IsNullOrWhiteSpace($Source) -or -not (Test-Path -LiteralPath $Source -PathType Container)) { return $true }
-    if ([System.IO.Path]::GetFullPath($Source).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')) { return $true }
-    Write-Info "Copying files: $Source -> $Destination"
-    Write-Host '       Robocopy progress is shown below. Large folders can take several minutes.' -ForegroundColor DarkGray
-    & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /XO /R:2 /W:1 /ETA 2>&1 | ForEach-Object {
-        Write-Host $_
-        Add-Log "robocopy: $_"
-    }
-    $exitCode = $LASTEXITCODE
-    Add-Log "robocopy exit ${exitCode}: $Source -> $Destination"
-    if ($exitCode -le 7) {
-        Write-Ok "Copy finished: $Destination"
-        return $true
-    }
-    Write-Fail "Copy failed with robocopy exit code $exitCode"
-    return $false
-}
-
 function Set-KnownFolderLayout {
     Initialize-KnownFolderApi
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -256,8 +236,9 @@ function Set-KnownFolderLayout {
             $target = $Layout[$spec.LayoutKey]
             $before += [pscustomobject]@{ Name = $spec.Name; Id = $spec.Id; Source = $current; Target = $target }
             New-Item -ItemType Directory -Path $target -Force | Out-Null
+            Write-Info "Path only: $($spec.Name) -> $target (existing files are not moved)"
             if ($current.TrimEnd('\') -ine $target.TrimEnd('\')) {
-                if (-not (Copy-KnownFolderContent -Source $current -Destination $target)) { throw "Could not copy existing files from $current" }
+                # Path-only mode: existing files remain untouched.
                 [KlpKnownFolder]::Set($spec.Id, $target)
                 $changed = $true
             }
@@ -512,7 +493,7 @@ function Set-BrowserDownloadPolicies {
     $mapping = @($browsers | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Source = $_.Source; Target = $_.Profile; Cache = $_.Cache } })
     $mapping | ConvertTo-Json -Depth 4 | Out-File -LiteralPath (Join-Path $Layout.Backups "browser-storage_$stamp.json") -Encoding UTF8
     foreach ($browser in $browsers) {
-        if (-not (Copy-KnownFolderContent -Source $browser.Source -Destination $browser.Profile)) { return "PROFILE_COPY_FAILED:$($browser.Name)" }
+                # Path-only mode: existing files remain untouched.
         New-Item -Path $browser.RegistryPath -Force | Out-Null
         New-ItemProperty -Path $browser.RegistryPath -Name 'DownloadDirectory' -Value $Layout.Downloads -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $browser.RegistryPath -Name 'UserDataDir' -Value $browser.PolicyProfile -PropertyType String -Force | Out-Null
@@ -812,7 +793,7 @@ function Select-Components {
         @{ Key = 'Rust'; Label = 'Rust toolchain (rustup + cargo)'; Question = 'Install Rust?'; Default = $true; Application = $true },
         @{ Key = 'npm_tools'; Label = 'pnpm'; Question = 'Install pnpm?'; Default = $true; Application = $true },
         @{ Key = 'tg_proxy'; Label = 'tg-ws-proxy'; Question = 'Download tg-ws-proxy?'; Default = $false; Application = $true },
-        @{ Key = 'KnownFolders'; Label = 'Windows personal folders'; Question = 'Move Desktop, Documents, Downloads, Pictures, Music, Videos and Saved Games to D:?'; Default = $true; Application = $false },
+        @{ Key = 'KnownFolders'; Label = 'Windows personal folders (paths only)'; Question = 'Set Desktop, Documents, Downloads, Pictures, Music, Videos and Saved Games paths to D: without moving existing files?'; Default = $true; Application = $false },
         @{ Key = 'DisableOneDrive'; Label = 'OneDrive'; Question = 'Uninstall and permanently block OneDrive?'; Default = $true; Application = $false },
         @{ Key = 'BrowserDownloads'; Label = 'Browser storage'; Question = 'Force browser downloads, profiles and caches to D:?'; Default = $true; Application = $false },
         @{ Key = 'WindowsStorage'; Label = 'Windows storage'; Question = 'Move the page file to D: and disable hibernation?'; Default = $true; Application = $false }
@@ -850,7 +831,7 @@ function Show-Plan {
     Write-Section 'Storage plan'
     foreach ($key in $Layout.Keys) { Write-Host "  $($key.PadRight(16)) $($Layout[$key])" }
     Write-Host ''
-    Write-Host '  Existing personal files are copied to D: and preserved at the source.' -ForegroundColor Yellow
+    Write-Host '  Existing personal files are NOT copied or moved.' -ForegroundColor Yellow
     Write-Host '  OneDrive is disabled only after known folders are redirected.' -ForegroundColor Yellow
     Write-Host '  Windows, WinGet itself, drivers and small system metadata remain on C:.' -ForegroundColor Yellow
     Write-Host '  Existing non-empty application folders on C: are never moved automatically.' -ForegroundColor Yellow
