@@ -26,7 +26,7 @@ jobs:
           if (-not $text.Contains("`$ScriptVersion = '4.1.0'")) { throw 'Expected installer version 4.1.0 not found' }
           $text = $text.Replace("`$ScriptVersion = '4.1.0'", "`$ScriptVersion = '4.2.0'")
 
-          # Remove all user-file migration code. Known folders become path-only.
+          # Remove the entire copy helper block.
           $copyStart = $text.IndexOf('function Copy-KnownFolderContent {')
           $layoutStart = $text.IndexOf('function Set-KnownFolderLayout {')
           if ($copyStart -lt 0 -or $layoutStart -lt 0 -or $layoutStart -le $copyStart) {
@@ -34,9 +34,12 @@ jobs:
           }
           $text = $text.Substring(0, $copyStart) + $text.Substring($layoutStart)
 
-          $copyCall = '                if (-not (Copy-KnownFolderContent -Source $current -Destination $target)) { throw "Could not copy existing files from $current" }'
-          if (-not $text.Contains($copyCall)) { throw 'Known-folder copy call not found' }
-          $text = $text.Replace($copyCall, '                # Path-only mode: existing files remain untouched.')
+          # Remove every remaining line that invokes the copy helper, regardless of spacing.
+          $text = [regex]::Replace(
+              $text,
+              '(?m)^.*Copy-KnownFolderContent\s+-Source.*(?:\r?\n|$)',
+              '                # Path-only mode: existing files remain untouched.' + "`r`n"
+          )
 
           $oldCreate = '            New-Item -ItemType Directory -Path $target -Force | Out-Null'
           $newCreate = $oldCreate + "`r`n" + '            Write-Info "Path only: $($spec.Name) -> $target (existing files are not moved)"'
@@ -48,12 +51,11 @@ jobs:
           if (-not $text.Contains($oldQuestion)) { throw 'Known-folder selection text not found' }
           $text = $text.Replace($oldQuestion, $newQuestion)
 
-          # Replace the human-readable plan text without depending on indentation.
           $text = $text.Replace('Existing personal files are copied to D: and preserved at the source.', 'Existing personal files are NOT copied or moved.')
 
-          # Verify the generated installer before writing it.
+          # Hard guard: the generated installer must contain no migration implementation.
           if ($text.Contains('function Copy-KnownFolderContent')) { throw 'Copy helper still exists after patch' }
-          if ($text.Contains('Copy-KnownFolderContent -Source')) { throw 'Copy helper call still exists after patch' }
+          if ($text.Contains('Copy-KnownFolderContent')) { throw 'Copy helper reference still exists after patch' }
           if ($text.Contains('robocopy.exe')) { throw 'robocopy migration code still exists after patch' }
           if ($text.Contains('Existing personal files are copied to D:')) { throw 'Old copy description still exists after patch' }
 
