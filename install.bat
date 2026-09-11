@@ -1,4 +1,5 @@
 @echo off
+setlocal
 title KlpInstall - Automatic D Setup
 set "KLP_SELF=%~f0"
 set "KLP_RUNNER=%~dp0run.ps1"
@@ -27,7 +28,9 @@ if not exist "%KLP_RUNNER%" (
     if errorlevel 1 goto download_error
 )
 
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%KLP_RUNNER%" -Automatic -BasePath "D:\"
+rem D:\. normalizes to D:\ but avoids a trailing backslash immediately before
+rem the closing quote in the Windows command line.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%KLP_RUNNER%" -Automatic -BasePath "D:\."
 set "KLP_EXIT=%ERRORLEVEL%"
 echo.
 if "%KLP_EXIT%"=="0" (
@@ -37,11 +40,11 @@ if "%KLP_EXIT%"=="0" (
 )
 echo  Press any key to close this window.
 pause >nul
-exit /b %KLP_EXIT%
+endlocal & exit /b %KLP_EXIT%
 
 :download_error
 echo.
 echo  KlpInstall could not be downloaded from GitHub.
 echo  Check the internet connection and try again.
 pause >nul
-exit /b 1
+endlocal & exit /b 1
