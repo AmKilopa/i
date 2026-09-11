@@ -9,10 +9,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
-$ScriptVersion = '4.0.0'
+$ScriptVersion = '4.1.0'
 $MinimumFreeSpaceGB = 50
 $Results = [ordered]@{}
 $LogFile = $null
@@ -133,21 +132,26 @@ function Invoke-DownloadFile {
     $parent = Split-Path -Parent $Destination
     if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     $partial = "$Destination.partial"
+    $displayName = [System.IO.Path]::GetFileName($Destination)
     for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $previousProgress = $ProgressPreference
         try {
             Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
-            $previousProgress = $ProgressPreference
-            $ProgressPreference = 'SilentlyContinue'
+            Write-Info "Downloading $displayName (attempt $attempt/3)..."
+            $ProgressPreference = 'Continue'
             Invoke-WebRequest -Uri $Uri -OutFile $partial -UseBasicParsing -TimeoutSec $TimeoutSec
             $ProgressPreference = $previousProgress
             if (-not (Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -eq 0) { throw 'The downloaded file is empty' }
             Move-Item -LiteralPath $partial -Destination $Destination -Force
+            $sizeMB = [math]::Round((Get-Item -LiteralPath $Destination).Length / 1MB, 1)
+            Write-Ok "Downloaded $displayName ($sizeMB MB)"
             return
         } catch {
             $ProgressPreference = $previousProgress
             Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
             Add-Log "Download attempt $attempt failed for ${Uri}: $($_.Exception.Message)"
             if ($attempt -eq 3) { throw }
+            Write-Warn "Download failed; retrying in $($attempt * 2) seconds..."
             Start-Sleep -Seconds ($attempt * 2)
         }
     }
@@ -222,10 +226,20 @@ function Copy-KnownFolderContent {
     param([string]$Source, [string]$Destination)
     if ([string]::IsNullOrWhiteSpace($Source) -or -not (Test-Path -LiteralPath $Source -PathType Container)) { return $true }
     if ([System.IO.Path]::GetFullPath($Source).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')) { return $true }
-    $output = & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /XO /R:2 /W:1 /NP /NFL /NDL /NJH /NJS 2>&1
+    Write-Info "Copying files: $Source -> $Destination"
+    Write-Host '       Robocopy progress is shown below. Large folders can take several minutes.' -ForegroundColor DarkGray
+    & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /XO /R:2 /W:1 /ETA 2>&1 | ForEach-Object {
+        Write-Host $_
+        Add-Log "robocopy: $_"
+    }
     $exitCode = $LASTEXITCODE
-    $output | ForEach-Object { Add-Log "robocopy: $_" }
-    return $exitCode -le 7
+    Add-Log "robocopy exit ${exitCode}: $Source -> $Destination"
+    if ($exitCode -le 7) {
+        Write-Ok "Copy finished: $Destination"
+        return $true
+    }
+    Write-Fail "Copy failed with robocopy exit code $exitCode"
+    return $false
 }
 
 function Set-KnownFolderLayout {
@@ -423,10 +437,15 @@ function Download-WingetInstaller {
         if ($selector.Scope) { $arguments += @('--scope', $Scope) }
         if ($selector.Architecture) { $arguments += @('--architecture', $Architecture) }
         $arguments += @('--download-directory', $Destination, '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
-        $output = & $WingetCommand @arguments 2>&1
+        Write-Info "WinGet download: $Id"
+        & $WingetCommand @arguments 2>&1 | ForEach-Object {
+            Write-Host $_
+            Add-Log "winget: $_"
+        }
         $exitCode = $LASTEXITCODE
-        $output | ForEach-Object { Add-Log "winget: $_" }
+        Add-Log "winget download $Id exit code: $exitCode"
         if ($exitCode -eq 0) { break }
+        Write-Warn "WinGet download attempt failed (exit $exitCode); trying a compatible selector..."
     }
     if ($exitCode -ne 0) {
         Write-Fail "Download failed for $Id (winget exit $exitCode)"
@@ -663,6 +682,7 @@ function Install-Application {
     $installerPath = Download-WingetInstaller -Id $Spec.Id -Scope $Spec.Scope -Destination $downloadDirectory
     if (-not $installerPath) { return 'DOWNLOAD_FAILED' }
     New-Item -ItemType Directory -Path $target -Force | Out-Null
+    Write-Info "Installing $Name to $target..."
     if (-not (Invoke-AppInstaller -Kind $Spec.Installer -InstallerPath $installerPath -Target $target)) { Write-Fail "$Name installer returned an error"; return 'INSTALLER_FAILED' }
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if (Test-AppAtTarget -Spec $Spec -Target $target) {
@@ -776,16 +796,44 @@ function Install-TelegramProxy {
 function Select-Components {
     $selection = [ordered]@{}
     Write-Section 'Component selection'
-    foreach ($name in $AppSpecs.Keys) { $selection[$name] = if ($SkipApplications) { $false } else { Prompt-YesNo "Install $name?" } }
-    $selection['Chocolatey'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Install Chocolatey?' }
-    $selection['Spotify'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Install Spotify?' }
-    $selection['Rust'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Install Rust?' $false }
-    $selection['npm_tools'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Install pnpm?' }
-    $selection['tg_proxy'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Download tg-ws-proxy?' $false }
-    $selection['KnownFolders'] = Prompt-YesNo 'Move Desktop, Documents, Downloads, Pictures, Music, Videos and Saved Games to D:?'
-    $selection['DisableOneDrive'] = Prompt-YesNo 'Uninstall and permanently block OneDrive?'
-    $selection['BrowserDownloads'] = Prompt-YesNo 'Force browser downloads, profiles and caches to D:?'
-    $selection['WindowsStorage'] = Prompt-YesNo 'Move the page file to D: and disable hibernation?'
+    Write-Host '  Choose what KlpInstall should install or configure.' -ForegroundColor White
+    Write-Host '  The component name is shown before every Y/N question.' -ForegroundColor DarkGray
+
+    $items = @(
+        @{ Key = 'Python'; Label = 'Python 3.12'; Question = 'Install Python 3.12?'; Default = $true; Application = $true },
+        @{ Key = 'Firefox'; Label = 'Mozilla Firefox'; Question = 'Install Firefox?'; Default = $true; Application = $true },
+        @{ Key = 'Node.js'; Label = 'Node.js LTS'; Question = 'Install Node.js LTS?'; Default = $true; Application = $true },
+        @{ Key = 'VS Code'; Label = 'Visual Studio Code'; Question = 'Install Visual Studio Code?'; Default = $true; Application = $true },
+        @{ Key = 'Discord'; Label = 'Discord'; Question = 'Install Discord?'; Default = $true; Application = $true },
+        @{ Key = 'Git'; Label = 'Git'; Question = 'Install Git?'; Default = $true; Application = $true },
+        @{ Key = 'Telegram'; Label = 'Telegram Desktop'; Question = 'Install Telegram Desktop?'; Default = $true; Application = $true },
+        @{ Key = 'Chocolatey'; Label = 'Chocolatey'; Question = 'Install Chocolatey?'; Default = $true; Application = $true },
+        @{ Key = 'Spotify'; Label = 'Spotify'; Question = 'Install Spotify?'; Default = $true; Application = $true },
+        @{ Key = 'Rust'; Label = 'Rust toolchain (rustup + cargo)'; Question = 'Install Rust?'; Default = $true; Application = $true },
+        @{ Key = 'npm_tools'; Label = 'pnpm'; Question = 'Install pnpm?'; Default = $true; Application = $true },
+        @{ Key = 'tg_proxy'; Label = 'tg-ws-proxy'; Question = 'Download tg-ws-proxy?'; Default = $false; Application = $true },
+        @{ Key = 'KnownFolders'; Label = 'Windows personal folders'; Question = 'Move Desktop, Documents, Downloads, Pictures, Music, Videos and Saved Games to D:?'; Default = $true; Application = $false },
+        @{ Key = 'DisableOneDrive'; Label = 'OneDrive'; Question = 'Uninstall and permanently block OneDrive?'; Default = $true; Application = $false },
+        @{ Key = 'BrowserDownloads'; Label = 'Browser storage'; Question = 'Force browser downloads, profiles and caches to D:?'; Default = $true; Application = $false },
+        @{ Key = 'WindowsStorage'; Label = 'Windows storage'; Question = 'Move the page file to D: and disable hibernation?'; Default = $true; Application = $false }
+    )
+
+    $index = 0
+    foreach ($item in $items) {
+        $index++
+        Write-Host ''
+        Write-Host ("  [{0}/{1}] {2}" -f $index, $items.Count, $item.Label) -ForegroundColor Cyan
+        if ($SkipApplications -and $item.Application) {
+            $selection[$item.Key] = $false
+            Write-Host '       SKIP - application installation disabled' -ForegroundColor DarkGray
+            continue
+        }
+        $selection[$item.Key] = Prompt-YesNo $item.Question $item.Default
+        $choice = if ($selection[$item.Key]) { 'YES' } else { 'NO' }
+        $choiceColor = if ($selection[$item.Key]) { 'Green' } else { 'DarkGray' }
+        Write-Host "       -> $choice" -ForegroundColor $choiceColor
+    }
+
     if ($selection['DisableOneDrive']) { $selection['KnownFolders'] = $true }
     if ($selection['Spotify']) { $selection['Chocolatey'] = $true }
     Write-Host ''
