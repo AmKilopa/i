@@ -1,646 +1,1169 @@
-#Requires -RunAsAdministrator
 #Requires -Version 5.1
 
 param(
-    [string]$BasePath,
+    [string]$BasePath = 'D:\',
     [switch]$Silent,
-    [switch]$SkipConfirm
+    [switch]$SkipConfirm,
+    [switch]$PlanOnly,
+    [switch]$SkipApplications
 )
 
 $ErrorActionPreference = 'Stop'
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
-# ── Config ──────────────────────────────────────────────────────────────────
-
-$SCRIPT_VERSION = '2.0.0'
-$MIN_DISK_SPACE_GB = 10
-$DOWNLOAD_RETRIES = 3
-$DOWNLOAD_TIMEOUT = 120
-
-$FOLDERS = @('Download', 'Project', 'Program', 'Games', 'Discord', 'Telegram')
-
-$WINGET_APPS = [ordered]@{
-    'Python'    = 'Python.Python.3.12'
-    'Opera GX'  = 'Opera.OperaGX'
-    'Node.js'   = 'OpenJS.NodeJS.LTS'
-    'VS Code'   = 'Microsoft.VisualStudioCode'
-    'Discord'   = 'Discord.Discord'
-    'Git'       = 'Git.Git'
-    'Telegram'  = 'Telegram.TelegramDesktop'
-}
-
-$NPM_PACKAGES = @('pnpm')
-
-$CHOCO_PACKAGES = @('spotify')
-
-# ── State tracking ──────────────────────────────────────────────────────────
-
+$ScriptVersion = '4.0.0'
+$MinimumFreeSpaceGB = 50
 $Results = [ordered]@{}
 $LogFile = $null
 $StartTime = Get-Date
+$RebootRequired = $false
+$WingetCommand = $null
 
-# ── UI Functions ────────────────────────────────────────────────────────────
-
-function Write-Ok($m) {
-    $msg = "  [ OK ] $m"
-    Write-Host '  [' -NoNewline; Write-Host ' OK ' -ForegroundColor Green -NoNewline; Write-Host "] $m"
-    Add-Log $msg
+$AppSpecs = [ordered]@{
+    'Python' = @{ Id = 'Python.Python.3.12'; Scope = 'machine'; Folder = 'Python312'; Executables = @('python.exe'); Installer = 'Python'; PathFolders = @('', 'Scripts') }
+    'Firefox' = @{ Id = 'Mozilla.Firefox.ru'; Scope = 'machine'; Folder = 'Firefox'; Executables = @('firefox.exe'); Installer = 'Firefox'; PathFolders = @() }
+    'Node.js' = @{ Id = 'OpenJS.NodeJS.LTS'; Scope = 'machine'; Folder = 'NodeJS'; Executables = @('node.exe'); Installer = 'Node'; PathFolders = @('') }
+    'VS Code' = @{ Id = 'Microsoft.VisualStudioCode'; Scope = 'machine'; Folder = 'VSCode'; Executables = @('Code.exe'); Installer = 'VSCode'; PathFolders = @('bin') }
+    'Discord' = @{ Id = 'Discord.Discord'; Scope = 'user'; Folder = 'Discord'; Executables = @('Update.exe', 'Discord.exe'); Installer = 'Discord'; PathFolders = @() }
+    'Git' = @{ Id = 'Git.Git'; Scope = 'machine'; Folder = 'Git'; Executables = @('git.exe'); Installer = 'Git'; PathFolders = @('cmd', 'bin') }
+    'Telegram' = @{ Id = 'Telegram.TelegramDesktop'; Scope = 'user'; Folder = 'Telegram'; Executables = @('Telegram.exe'); Installer = 'Telegram'; PathFolders = @('') }
 }
 
-function Write-Info($m) {
-    $msg = "  [INFO] $m"
-    Write-Host '  [' -NoNewline; Write-Host 'INFO' -ForegroundColor Cyan -NoNewline; Write-Host "] $m"
-    Add-Log $msg
+function Add-Log {
+    param([string]$Message)
+    if ($LogFile) {
+        "[$(Get-Date -Format 'HH:mm:ss')] $Message" | Out-File -LiteralPath $LogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
 }
 
-function Write-Warn($m) {
-    $msg = "  [WARN] $m"
-    Write-Host '  [' -NoNewline; Write-Host 'WARN' -ForegroundColor Yellow -NoNewline; Write-Host "] $m"
-    Add-Log $msg
+function Write-State {
+    param([string]$Type, [string]$Message, [ConsoleColor]$Color)
+    Write-Host '  [' -NoNewline
+    Write-Host $Type.PadRight(4) -ForegroundColor $Color -NoNewline
+    Write-Host "] $Message"
+    Add-Log "[$Type] $Message"
 }
 
-function Write-Fail($m) {
-    $msg = "  [FAIL] $m"
-    Write-Host '  [' -NoNewline; Write-Host 'FAIL' -ForegroundColor Red -NoNewline; Write-Host "] $m"
-    Add-Log $msg
-}
-
-function Write-Section($m) {
-    Write-Host ''
-    Write-Host "  -- $m --" -ForegroundColor Cyan
-    Add-Log "-- $m --"
-}
+function Write-Ok { param([string]$Message) Write-State 'OK' $Message Green }
+function Write-Info { param([string]$Message) Write-State 'INFO' $Message Cyan }
+function Write-Warn { param([string]$Message) Write-State 'WARN' $Message Yellow }
+function Write-Fail { param([string]$Message) Write-State 'FAIL' $Message Red }
+function Write-Section { param([string]$Message) Write-Host ''; Write-Host "  -- $Message --" -ForegroundColor Cyan; Add-Log "-- $Message --" }
 
 function Write-Banner {
-    $w = 52
-    $line = "+" + ("=" * $w) + "+"
-    Clear-Host
+    $width = 56
+    $line = '+' + ('=' * $width) + '+'
+    try { Clear-Host } catch {}
     Write-Host ''
     Write-Host "  $line" -ForegroundColor Cyan
-    Write-Host ("  |" + "  Windows Setup Script v$SCRIPT_VERSION".PadRight($w) + "|") -ForegroundColor Cyan
-    Write-Host ("  |" + "  Clean install, custom base path".PadRight($w) + "|") -ForegroundColor Cyan
-    Write-Host ("  |" + "  $(Get-Date -Format 'yyyy-MM-dd HH:mm')".PadRight($w) + "|") -ForegroundColor Cyan
+    Write-Host ('  |' + "  Windows D: Setup v$ScriptVersion".PadRight($width) + '|') -ForegroundColor Cyan
+    Write-Host ('  |' + '  Applications, downloads and caches on D:'.PadRight($width) + '|') -ForegroundColor Cyan
+    Write-Host ('  |' + "  $(Get-Date -Format 'yyyy-MM-dd HH:mm')".PadRight($width) + '|') -ForegroundColor Cyan
     Write-Host "  $line" -ForegroundColor Cyan
     Write-Host ''
 }
 
-function Write-ProgressStep($current, $total, $label) {
-    if ($total -le 0) { return }
-    $pct = [math]::Round(($current / $total) * 100)
-    $barLen = 30
-    $filled = [math]::Round($barLen * $current / $total)
-    $empty = $barLen - $filled
-    $bar = ("#" * $filled) + ("-" * $empty)
-    Write-Host "`r  [$bar] $pct% - $label    " -NoNewline -ForegroundColor Gray
+function Prompt-YesNo {
+    param([string]$Question, [bool]$Default = $true)
+    if ($SkipConfirm -or $Silent) { return $Default }
+    $hint = if ($Default) { '(Y/n)' } else { '(y/N)' }
+    $answer = Read-Host "  $Question $hint"
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
+    return $answer.Trim().ToLowerInvariant() -eq 'y'
 }
 
-function Show-Report {
-    $w = 52
-    $line = "+" + ("-" * $w) + "+"
-    $elapsed = (Get-Date) - $StartTime
-
-    Write-Host ''
-    Write-Host ''
-    Write-Host "  $line" -ForegroundColor White
-    Write-Host ("  |" + "  INSTALLATION REPORT".PadRight($w) + "|") -ForegroundColor White
-    Write-Host "  $line" -ForegroundColor White
-
-    $ok = 0; $fail = 0; $skip = 0
-    foreach ($key in $Results.Keys) {
-        $status = $Results[$key]
-        $padW = $w - 2
-        switch ($status) {
-            'OK' {
-                $text = "  [+] $key"
-                Write-Host ("  |" + $text.PadRight($padW) + "|") -ForegroundColor Green
-                $ok++
-            }
-            'SKIP' {
-                $text = "  [-] $key (skipped)"
-                Write-Host ("  |" + $text.PadRight($padW) + "|") -ForegroundColor DarkGray
-                $skip++
-            }
-            'EXISTS' {
-                $text = "  [~] $key (already installed)"
-                Write-Host ("  |" + $text.PadRight($padW) + "|") -ForegroundColor DarkGray
-                $ok++
-            }
-            default {
-                $text = "  [X] $key : $status"
-                if ($text.Length -gt $padW) { $text = $text.Substring(0, $padW) }
-                Write-Host ("  |" + $text.PadRight($padW) + "|") -ForegroundColor Red
-                $fail++
-            }
-        }
-    }
-
-    Write-Host "  $line" -ForegroundColor White
-    $summaryText = "  OK: $ok  Failed: $fail  Skipped: $skip"
-    Write-Host ("  |" + $summaryText.PadRight($w) + "|") -ForegroundColor White
-    $timeText = "  Time: $($elapsed.ToString('mm\:ss'))"
-    Write-Host ("  |" + $timeText.PadRight($w) + "|") -ForegroundColor White
-    if ($LogFile) {
-        $logText = "  Log: $LogFile"
-        if ($logText.Length -gt $w) { $logText = $logText.Substring(0, $w) }
-        Write-Host ("  |" + $logText.PadRight($w) + "|") -ForegroundColor White
-    }
-    Write-Host "  $line" -ForegroundColor White
-    Write-Host ''
+function Get-FullBasePath {
+    param([string]$Path)
+    if (-not [System.IO.Path]::IsPathRooted($Path)) { throw 'BasePath must be an absolute path on a non-system drive' }
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    $systemRoot = [System.IO.Path]::GetPathRoot($env:SystemRoot)
+    if ($root.TrimEnd('\') -ieq $systemRoot.TrimEnd('\')) { throw "BasePath cannot be on the system drive $systemRoot" }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "Drive $root is unavailable" }
+    if ($fullPath.TrimEnd('\') -ieq $root.TrimEnd('\')) { return $root }
+    return $fullPath.TrimEnd('\')
 }
 
-# ── Utility Functions ───────────────────────────────────────────────────────
-
-function Add-Log($m) {
-    if ($LogFile) {
-        $ts = Get-Date -Format 'HH:mm:ss'
-        "[$ts] $m" | Out-File -FilePath $LogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
-    }
+function Get-FreeSpaceGB {
+    param([string]$Path)
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    $drive = Get-PSDrive -Name $root.Substring(0, 1) -ErrorAction Stop
+    return [math]::Round($drive.Free / 1GB, 2)
 }
 
-function Refresh-Path {
-    $m = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-    $u = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    $env:PATH = "$m;$u"
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Add-ToSystemPath($dir) {
-    $current = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-    if ($current -notlike "*$dir*") {
-        [System.Environment]::SetEnvironmentVariable('PATH', "$dir;$current", 'Machine')
-        $env:PATH = "$dir;$env:PATH"
-        return $true
-    }
-    return $false
+function Assert-SupportedSystem {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Windows is required' }
+    $version = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $build = [int]$version.CurrentBuildNumber
+    if ($build -lt 17763) { throw "Windows build $build is not supported. Windows 10 1809 or newer is required." }
+    if (-not [Environment]::Is64BitOperatingSystem) { throw 'A 64-bit version of Windows is required' }
+    if (-not $PlanOnly -and -not (Test-IsAdministrator)) { throw 'Run install.bat or run.ps1 and approve the administrator prompt' }
 }
 
-function Backup-PathVariable {
-    $pathBackup = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-    $backupFile = "$BASE\Download\PATH_BACKUP_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-    $pathBackup | Out-File -FilePath $backupFile -Encoding UTF8
-    Write-Info "PATH backed up to $backupFile"
+function Get-DataVolume {
+    param([string]$Path)
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    $deviceId = $root.TrimEnd('\')
+    $volume = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$deviceId'" -ErrorAction Stop
+    if (-not $volume) { throw "Drive $root was not found" }
+    if ([int]$volume.DriveType -ne 3) { throw "Drive $root must be a fixed local drive" }
+    if ($volume.FileSystem -ne 'NTFS') { throw "Drive $root must use NTFS. Current filesystem: $($volume.FileSystem)" }
+    return $volume
 }
 
 function Test-Internet {
-    try {
-        $r = Invoke-WebRequest -Uri 'https://www.google.com' -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-        return $r.StatusCode -eq 200
-    } catch {
-        return $false
-    }
-}
-
-function Test-DiskSpace($path, $minGB) {
-    try {
-        $drive = $path.Substring(0, 1)
-        $disk = Get-PSDrive -Name $drive -ErrorAction Stop
-        $freeGB = [math]::Round($disk.Free / 1GB, 2)
-        return @{ OK = ($freeGB -ge $minGB); FreeGB = $freeGB }
-    } catch {
-        return @{ OK = $true; FreeGB = -1 }
-    }
-}
-
-function Download-File {
-    param(
-        [string]$Url,
-        [string]$Dest,
-        [string]$Label,
-        [int]$Retries = $DOWNLOAD_RETRIES
-    )
-
-    for ($i = 1; $i -le $Retries; $i++) {
-        $wc = $null
+    foreach ($uri in @('https://cdn.winget.microsoft.com/cache/source.msix', 'https://api.github.com')) {
         try {
-            $wc = New-Object System.Net.WebClient
-            $wc.Headers.Add('User-Agent', 'Mozilla/5.0')
-            $wc.DownloadFile($Url, $Dest)
-
-            if ((Test-Path $Dest) -and (Get-Item $Dest).Length -gt 0) {
-                Write-Ok "$Label"
-                return $true
-            } else {
-                throw "Downloaded file is empty"
-            }
-        } catch {
-            if ($i -lt $Retries) {
-                Write-Warn "$Label attempt $i/$Retries failed: $_"
-                Start-Sleep -Seconds 3
-            } else {
-                Write-Fail "$Label after $Retries attempts: $_"
-                return $false
-            }
-        } finally {
-            if ($wc) { $wc.Dispose() }
-        }
+            $response = Invoke-WebRequest -Uri $uri -Method Head -UseBasicParsing -TimeoutSec 20
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) { return $true }
+        } catch {}
     }
     return $false
 }
 
-function Install-WingetPackage($id, $label) {
-    try {
-        $check = winget list --id $id --exact --source winget 2>&1
-        if ($LASTEXITCODE -eq 0 -and $check -match $id) {
-            Write-Ok "$label (already installed)"
-            return 'EXISTS'
+function Invoke-DownloadFile {
+    param([string]$Uri, [string]$Destination, [int]$TimeoutSec = 180)
+    $parent = Split-Path -Parent $Destination
+    if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $partial = "$Destination.partial"
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+            $previousProgress = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $Uri -OutFile $partial -UseBasicParsing -TimeoutSec $TimeoutSec
+            $ProgressPreference = $previousProgress
+            if (-not (Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -eq 0) { throw 'The downloaded file is empty' }
+            Move-Item -LiteralPath $partial -Destination $Destination -Force
+            return
+        } catch {
+            $ProgressPreference = $previousProgress
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+            Add-Log "Download attempt $attempt failed for ${Uri}: $($_.Exception.Message)"
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Seconds ($attempt * 2)
         }
-    } catch {}
-
-    Write-Host "    Installing $label..." -ForegroundColor Gray
-    try {
-        $output = winget install --id $id --exact --source winget --silent `
-            --accept-package-agreements --accept-source-agreements 2>&1
-
-        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) {
-            Write-Ok $label
-            return 'OK'
-        } else {
-            Write-Fail "$label (winget exit: $LASTEXITCODE)"
-            return "winget exit $LASTEXITCODE"
-        }
-    } catch {
-        Write-Fail "$label : $_"
-        return "$_"
     }
 }
 
-function Prompt-YesNo($question, $default = 'y') {
-    if ($SkipConfirm) { return $true }
-    $hint = if ($default -eq 'y') { '(Y/n)' } else { '(y/N)' }
-    $r = Read-Host "  $question $hint"
-    if ([string]::IsNullOrWhiteSpace($r)) { $r = $default }
-    return $r.Trim().ToLower() -eq 'y'
+function Set-PersistentEnvironment {
+    param([string]$Name, [string]$Value, [ValidateSet('User', 'Machine')][string]$Target = 'User')
+    [System.Environment]::SetEnvironmentVariable($Name, $Value, $Target)
+    Set-Item -Path "Env:$Name" -Value $Value
+    Write-Ok "$Name -> $Value"
+}
+
+function Export-EnvironmentState {
+    $userValues = [ordered]@{}
+    $machineValues = [ordered]@{}
+    foreach ($name in $StorageEnvironment.Keys) { $userValues[$name] = [Environment]::GetEnvironmentVariable($name, 'User') }
+    foreach ($name in $MachineEnvironment.Keys) { $machineValues[$name] = [Environment]::GetEnvironmentVariable($name, 'Machine') }
+    $state = [ordered]@{
+        Timestamp = (Get-Date).ToString('o')
+        User = $userValues
+        Machine = $machineValues
+        UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        MachinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    }
+    $path = Join-Path $Layout.Backups "environment_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+    $state | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $path -Encoding UTF8
+    Write-Info "Environment backup -> $path"
+}
+
+function Initialize-KnownFolderApi {
+    if ('KlpKnownFolder' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class KlpKnownFolder
+{
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SHGetKnownFolderPath(ref Guid id, uint flags, IntPtr token, out IntPtr path);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SHSetKnownFolderPath(ref Guid id, uint flags, IntPtr token, string path);
+
+    public static string Get(string value)
+    {
+        Guid id = new Guid(value);
+        IntPtr pointer;
+        int result = SHGetKnownFolderPath(ref id, 0, IntPtr.Zero, out pointer);
+        if (result != 0) Marshal.ThrowExceptionForHR(result);
+        try { return Marshal.PtrToStringUni(pointer); }
+        finally { Marshal.FreeCoTaskMem(pointer); }
+    }
+
+    public static void Set(string value, string path)
+    {
+        Guid id = new Guid(value);
+        int result = SHSetKnownFolderPath(ref id, 0x2000, IntPtr.Zero, path);
+        if (result != 0) Marshal.ThrowExceptionForHR(result);
+    }
+}
+'@
+}
+
+function Export-RegistryKey {
+    param([string]$Key, [string]$Destination)
+    & reg.exe query $Key 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    & reg.exe export $Key $Destination /y | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+function Copy-KnownFolderContent {
+    param([string]$Source, [string]$Destination)
+    if ([string]::IsNullOrWhiteSpace($Source) -or -not (Test-Path -LiteralPath $Source -PathType Container)) { return $true }
+    if ([System.IO.Path]::GetFullPath($Source).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')) { return $true }
+    $output = & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /XO /R:2 /W:1 /NP /NFL /NDL /NJH /NJS 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object { Add-Log "robocopy: $_" }
+    return $exitCode -le 7
+}
+
+function Set-KnownFolderLayout {
+    Initialize-KnownFolderApi
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $registryBackup = Join-Path $Layout.Backups "user-shell-folders_$stamp.reg"
+    if (-not (Export-RegistryKey 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' $registryBackup)) { throw 'Could not back up current known-folder settings' }
+    $before = @()
+    $failures = @()
+    $changed = $false
+    foreach ($spec in $KnownFolderSpecs) {
+        try {
+            $current = [KlpKnownFolder]::Get($spec.Id)
+            $target = $Layout[$spec.LayoutKey]
+            $before += [pscustomobject]@{ Name = $spec.Name; Id = $spec.Id; Source = $current; Target = $target }
+            New-Item -ItemType Directory -Path $target -Force | Out-Null
+            if ($current.TrimEnd('\') -ine $target.TrimEnd('\')) {
+                if (-not (Copy-KnownFolderContent -Source $current -Destination $target)) { throw "Could not copy existing files from $current" }
+                [KlpKnownFolder]::Set($spec.Id, $target)
+                $changed = $true
+            }
+            $actual = [KlpKnownFolder]::Get($spec.Id)
+            if ($actual.TrimEnd('\') -ine $target.TrimEnd('\')) { throw "Windows returned $actual" }
+            Write-Ok "$($spec.Name) -> $target"
+        } catch {
+            $failures += $spec.Name
+            Write-Fail "$($spec.Name): $($_.Exception.Message)"
+        }
+    }
+    $mappingPath = Join-Path $Layout.Backups "known-folders_$stamp.json"
+    $before | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $mappingPath -Encoding UTF8
+    Write-Info "Known-folder backup -> $mappingPath"
+    if ($failures.Count -gt 0) { return "FAILED: $($failures -join ', ')" }
+    if ($changed) { $script:RebootRequired = $true }
+    return 'OK'
+}
+
+function Refresh-Path {
+    $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = "$machinePath;$userPath"
+}
+
+function Add-ToPath {
+    param([string]$Directory, [ValidateSet('User', 'Machine')][string]$Target = 'Machine')
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return }
+    $current = [System.Environment]::GetEnvironmentVariable('Path', $Target)
+    $parts = @($current -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not ($parts | Where-Object { $_.TrimEnd('\') -ieq $Directory.TrimEnd('\') })) {
+        [System.Environment]::SetEnvironmentVariable('Path', (@($Directory) + $parts) -join ';', $Target)
+        Write-Ok "PATH -> $Directory"
+    }
+}
+
+function Test-AppAtTarget {
+    param([hashtable]$Spec, [string]$Target)
+    if (-not (Test-Path -LiteralPath $Target -PathType Container)) { return $false }
+    foreach ($name in $Spec.Executables) {
+        if (Get-ChildItem -LiteralPath $Target -Recurse -File -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1) { return $true }
+    }
+    return $false
+}
+
+function Test-WingetPackageInstalled {
+    param([string]$Id)
+    if (-not $WingetCommand) { return $false }
+    $output = & $WingetCommand list --id $Id --exact --source winget --accept-source-agreements --disable-interactivity 2>&1
+    $exitCode = $LASTEXITCODE
+    return $exitCode -eq 0 -and (($output -join "`n") -match [regex]::Escape($Id))
+}
+
+function Resolve-WingetCommand {
+    Refresh-Path
+    $command = Get-Command winget.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    $aliasPath = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    if (Test-Path -LiteralPath $aliasPath -PathType Leaf) { return $aliasPath }
+    $package = Get-AppxPackage -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+    if ($package) {
+        $packageCommand = Join-Path $package.InstallLocation 'winget.exe'
+        if (Test-Path -LiteralPath $packageCommand -PathType Leaf) { return $packageCommand }
+    }
+    return $null
+}
+
+function Ensure-Winget {
+    $script:WingetCommand = Resolve-WingetCommand
+    if (-not $script:WingetCommand) {
+        try {
+            $addAppx = Get-Command Add-AppxPackage -ErrorAction Stop
+            if ($addAppx.Parameters.ContainsKey('RegisterByFamilyName')) {
+                Add-AppxPackage -RegisterByFamilyName -MainPackage 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -ErrorAction Stop
+            }
+        } catch { Add-Log "WinGet registration: $($_.Exception.Message)" }
+        $script:WingetCommand = Resolve-WingetCommand
+    }
+    if (-not $script:WingetCommand) {
+        try {
+            $oldProgress = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            Install-PackageProvider -Name NuGet -Force -Scope AllUsers -Confirm:$false | Out-Null
+            if (-not (Get-Module -ListAvailable -Name Microsoft.WinGet.Client)) {
+                Install-Module -Name Microsoft.WinGet.Client -Repository PSGallery -Scope AllUsers -Force -AllowClobber -Confirm:$false
+            }
+            Import-Module Microsoft.WinGet.Client -Force
+            $repair = Get-Command Repair-WinGetPackageManager -ErrorAction Stop
+            $repairArguments = @{ AllUsers = $true }
+            if ($repair.Parameters.ContainsKey('Force')) { $repairArguments.Force = $true }
+            if ($repair.Parameters.ContainsKey('Latest')) { $repairArguments.Latest = $true }
+            & $repair @repairArguments | Out-Null
+            $ProgressPreference = $oldProgress
+        } catch {
+            $ProgressPreference = $oldProgress
+            Add-Log "WinGet repair: $($_.Exception.Message)"
+        }
+        $script:WingetCommand = Resolve-WingetCommand
+    }
+    if (-not $script:WingetCommand) {
+        try {
+            $bundleDirectory = Join-Path $Layout.Installers 'WinGet'
+            $bundlePath = Join-Path $bundleDirectory 'Microsoft.DesktopAppInstaller.msixbundle'
+            New-Item -ItemType Directory -Path $bundleDirectory -Force | Out-Null
+            Invoke-DownloadFile -Uri 'https://aka.ms/getwinget' -Destination $bundlePath
+            Add-AppxPackage -Path $bundlePath -ErrorAction Stop
+        } catch { Add-Log "WinGet App Installer: $($_.Exception.Message)" }
+        $script:WingetCommand = Resolve-WingetCommand
+    }
+    if (-not $script:WingetCommand) { throw 'WinGet could not be installed automatically' }
+    $sourceOutput = & $script:WingetCommand source update --disable-interactivity 2>&1
+    $sourceOutput | ForEach-Object { Add-Log "winget source: $_" }
+    Write-Ok "WinGet $(& $script:WingetCommand --version)"
+    return 'OK'
+}
+
+function Ensure-Junction {
+    param([string]$Link, [string]$Target)
+    New-Item -ItemType Directory -Path $Target -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $Link) -Force | Out-Null
+    if (Test-Path -LiteralPath $Link) {
+        $item = Get-Item -LiteralPath $Link -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $currentTarget = @($item.Target)[0]
+            if ($currentTarget -and ([System.IO.Path]::GetFullPath($currentTarget).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($Target).TrimEnd('\'))) {
+                Write-Ok "$Link -> $Target"
+                return $true
+            }
+            Write-Warn "Existing link points elsewhere: $Link"
+            return $false
+        }
+        if ($item.PSIsContainer -and -not (Get-ChildItem -LiteralPath $Link -Force | Select-Object -First 1)) {
+            Remove-Item -LiteralPath $Link -Force
+        } else {
+            Write-Warn "Existing data was not moved: $Link"
+            return $false
+        }
+    }
+    New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null
+    Write-Ok "$Link -> $Target"
+    return $true
+}
+
+function Get-AppJunctions {
+    param([string]$Name, [string]$ProgramTarget)
+    switch ($Name) {
+        'Firefox' { return @(@{ Link = Join-Path $env:APPDATA 'Mozilla'; Target = Join-Path $Layout.AppData 'Firefox\Roaming' }, @{ Link = Join-Path $env:LOCALAPPDATA 'Mozilla'; Target = Join-Path $Layout.AppData 'Firefox\Local' }) }
+        'VS Code' { return @(@{ Link = Join-Path $env:APPDATA 'Code'; Target = Join-Path $Layout.AppData 'VSCode\Roaming' }, @{ Link = Join-Path $env:USERPROFILE '.vscode'; Target = Join-Path $Layout.AppData 'VSCode\Profile' }) }
+        'Discord' { return @(@{ Link = Join-Path $env:LOCALAPPDATA 'Discord'; Target = $ProgramTarget }, @{ Link = Join-Path $env:APPDATA 'discord'; Target = Join-Path $Layout.AppData 'Discord\Roaming' }) }
+        'Telegram' { return @(@{ Link = Join-Path $env:APPDATA 'Telegram Desktop'; Target = Join-Path $Layout.AppData 'Telegram' }) }
+        'Spotify' { return @(@{ Link = Join-Path $env:APPDATA 'Spotify'; Target = $ProgramTarget }, @{ Link = Join-Path $env:LOCALAPPDATA 'Spotify'; Target = Join-Path $Layout.AppData 'Spotify\Local' }) }
+        default { return @() }
+    }
+}
+
+function Initialize-AppStorage {
+    param([string]$Name, [string]$ProgramTarget)
+    foreach ($junction in @(Get-AppJunctions -Name $Name -ProgramTarget $ProgramTarget)) {
+        if (-not (Ensure-Junction -Link $junction.Link -Target $junction.Target)) { return $false }
+    }
+    return $true
+}
+
+function Download-WingetInstaller {
+    param([string]$Id, [string]$Scope, [string]$Destination)
+    if (-not $WingetCommand) { return $null }
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $selectors = @(
+        @{ Scope = $true; Architecture = $true },
+        @{ Scope = $false; Architecture = $true },
+        @{ Scope = $true; Architecture = $false },
+        @{ Scope = $false; Architecture = $false }
+    )
+    $exitCode = -1
+    foreach ($selector in $selectors) {
+        $arguments = @('download', '--id', $Id, '--exact', '--source', 'winget')
+        if ($selector.Scope) { $arguments += @('--scope', $Scope) }
+        if ($selector.Architecture) { $arguments += @('--architecture', $Architecture) }
+        $arguments += @('--download-directory', $Destination, '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+        $output = & $WingetCommand @arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        $output | ForEach-Object { Add-Log "winget: $_" }
+        if ($exitCode -eq 0) { break }
+    }
+    if ($exitCode -ne 0) {
+        Write-Fail "Download failed for $Id (winget exit $exitCode)"
+        return $null
+    }
+    $installer = Get-ChildItem -LiteralPath $Destination -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.exe', '.msi', '.msix', '.msixbundle') } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $installer) {
+        Write-Fail "Installer file not found for $Id"
+        return $null
+    }
+    Write-Ok "Downloaded to $($installer.FullName)"
+    return $installer.FullName
+}
+
+function Quote-Argument { param([string]$Value) return '"' + $Value.Replace('"', '\"') + '"' }
+
+function Set-FirefoxConfiguration {
+    param([string]$Target)
+    $distribution = Join-Path $Target 'distribution'
+    $policyPath = Join-Path $distribution 'policies.json'
+    $policy = [ordered]@{
+        policies = [ordered]@{
+            DisableFirefoxStudies = $true
+            DisablePocket = $true
+            DisableTelemetry = $true
+            DefaultDownloadDirectory = $Layout.Downloads
+            DownloadDirectory = $Layout.Downloads
+            FirefoxHome = [ordered]@{
+                Search = $true
+                TopSites = $true
+                SponsoredTopSites = $false
+                Highlights = $false
+                Pocket = $false
+                Stories = $false
+                SponsoredPocket = $false
+                SponsoredStories = $false
+                Snippets = $false
+            }
+            NoDefaultBookmarks = $true
+            UserMessaging = [ordered]@{
+                ExtensionRecommendations = $false
+                FeatureRecommendations = $false
+                MoreFromMozilla = $false
+                SkipOnboarding = $true
+                UrlbarInterventions = $false
+                WhatsNew = $false
+            }
+        }
+    }
+    New-Item -ItemType Directory -Path $distribution -Force | Out-Null
+    $policy | ConvertTo-Json -Depth 6 | Out-File -LiteralPath $policyPath -Encoding UTF8
+    Write-Ok "Firefox clean configuration -> $policyPath"
+}
+
+function Set-BrowserDownloadPolicies {
+    Get-Process -Name msedge, chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    Export-RegistryKey 'HKLM\SOFTWARE\Policies\Microsoft\Edge' (Join-Path $Layout.Backups "edge-policies_$stamp.reg") | Out-Null
+    Export-RegistryKey 'HKLM\SOFTWARE\Policies\Google\Chrome' (Join-Path $Layout.Backups "chrome-policies_$stamp.reg") | Out-Null
+    $browsers = @(
+        @{ Name = 'Edge'; RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Source = Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'; Profile = $Layout.EdgeProfile; Cache = $Layout.EdgeCache; PolicyProfile = $BrowserPolicyPaths.EdgeProfile; PolicyCache = $BrowserPolicyPaths.EdgeCache },
+        @{ Name = 'Chrome'; RegistryPath = 'HKLM:\SOFTWARE\Policies\Google\Chrome'; Source = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'; Profile = $Layout.ChromeProfile; Cache = $Layout.ChromeCache; PolicyProfile = $BrowserPolicyPaths.ChromeProfile; PolicyCache = $BrowserPolicyPaths.ChromeCache }
+    )
+    $mapping = @($browsers | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Source = $_.Source; Target = $_.Profile; Cache = $_.Cache } })
+    $mapping | ConvertTo-Json -Depth 4 | Out-File -LiteralPath (Join-Path $Layout.Backups "browser-storage_$stamp.json") -Encoding UTF8
+    foreach ($browser in $browsers) {
+        if (-not (Copy-KnownFolderContent -Source $browser.Source -Destination $browser.Profile)) { return "PROFILE_COPY_FAILED:$($browser.Name)" }
+        New-Item -Path $browser.RegistryPath -Force | Out-Null
+        New-ItemProperty -Path $browser.RegistryPath -Name 'DownloadDirectory' -Value $Layout.Downloads -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $browser.RegistryPath -Name 'UserDataDir' -Value $browser.PolicyProfile -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $browser.RegistryPath -Name 'DiskCacheDir' -Value $browser.PolicyCache -PropertyType String -Force | Out-Null
+    }
+    Write-Ok "Browser downloads -> $($Layout.Downloads)"
+    Write-Ok 'Edge and Chrome profiles and caches -> D:'
+    return 'OK'
+}
+
+function Disable-OneDrive {
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $backups = @(
+        @{ Key = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive'; Name = "onedrive-machine_$stamp.reg" },
+        @{ Key = 'HKLM\SOFTWARE\Policies\Microsoft\OneDrive'; Name = "onedrive-machine-sync_$stamp.reg" },
+        @{ Key = 'HKCU\SOFTWARE\Policies\Microsoft\OneDrive'; Name = "onedrive-user_$stamp.reg" }
+    )
+    foreach ($backup in $backups) { Export-RegistryKey $backup.Key (Join-Path $Layout.Backups $backup.Name) | Out-Null }
+    Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $windowsPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
+    $machinePolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
+    $userPolicy = 'HKCU:\SOFTWARE\Policies\Microsoft\OneDrive'
+    New-Item -Path $windowsPolicy, $machinePolicy, $userPolicy -Force | Out-Null
+    New-ItemProperty -Path $windowsPolicy -Name 'DisableFileSyncNGSC' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $windowsPolicy -Name 'DisableFileSync' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $machinePolicy -Name 'KFMBlockOptIn' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $machinePolicy -Name 'DisableAutoConfig' -Value 3 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $machinePolicy -Name 'PreventNetworkTrafficPreUserSignIn' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $userPolicy -Name 'DisablePersonalSync' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $userPolicy -Name 'EnableAutoStart' -Value 0 -PropertyType DWord -Force | Out-Null
+    Remove-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'OneDrive' -ErrorAction SilentlyContinue
+    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+        Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'OneDrive*' } | ForEach-Object {
+            Disable-ScheduledTask -InputObject $_ -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+    foreach ($registryPath in @(
+        'Registry::HKEY_CLASSES_ROOT\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+        'Registry::HKEY_CLASSES_ROOT\WOW6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
+    )) {
+        if (Test-Path -LiteralPath $registryPath) {
+            New-ItemProperty -LiteralPath $registryPath -Name 'System.IsPinnedToNameSpaceTree' -Value 0 -PropertyType DWord -Force | Out-Null
+        }
+    }
+    $uninstallers = @(
+        (Join-Path $env:SystemRoot 'System32\OneDriveSetup.exe'),
+        (Join-Path $env:SystemRoot 'SysWOW64\OneDriveSetup.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\OneDrive\OneDriveSetup.exe')
+    ) | Select-Object -Unique
+    foreach ($uninstaller in $uninstallers) {
+        if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
+            try { Start-Process -FilePath $uninstaller -ArgumentList '/uninstall' -Wait -ErrorAction Stop | Out-Null } catch { Add-Log "OneDrive uninstaller: $($_.Exception.Message)" }
+        }
+    }
+    Get-AppxPackage -Name 'Microsoft.OneDriveSync' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue
+    if ($WingetCommand) {
+        $output = & $WingetCommand uninstall --id Microsoft.OneDrive --exact --silent --disable-interactivity --accept-source-agreements 2>&1
+        $output | ForEach-Object { Add-Log "OneDrive winget: $_" }
+    }
+    $guardDirectory = Join-Path $env:ProgramData 'KlpInstall'
+    $guardPath = Join-Path $guardDirectory 'OneDriveGuard.ps1'
+    $guardContent = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$windowsPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
+$machinePolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
+New-Item -Path $windowsPolicy, $machinePolicy -Force | Out-Null
+New-ItemProperty -Path $windowsPolicy -Name 'DisableFileSyncNGSC' -Value 1 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $windowsPolicy -Name 'DisableFileSync' -Value 1 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $machinePolicy -Name 'KFMBlockOptIn' -Value 1 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $machinePolicy -Name 'DisableAutoConfig' -Value 3 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $machinePolicy -Name 'PreventNetworkTrafficPreUserSignIn' -Value 1 -PropertyType DWord -Force | Out-Null
+Get-Process -Name OneDrive | Stop-Process -Force
+foreach ($uninstaller in @("$env:SystemRoot\System32\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe")) {
+    if (Test-Path -LiteralPath $uninstaller -PathType Leaf) { Start-Process -FilePath $uninstaller -ArgumentList '/uninstall' -Wait }
+}
+'@
+    New-Item -ItemType Directory -Path $guardDirectory -Force | Out-Null
+    [System.IO.File]::WriteAllText($guardPath, $guardContent, (New-Object System.Text.UTF8Encoding($false)))
+    if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) { return 'GUARD_UNAVAILABLE' }
+    $guardAction = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$guardPath`""
+    $guardTrigger = New-ScheduledTaskTrigger -AtStartup
+    $guardPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $guardSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    Register-ScheduledTask -TaskName 'KlpInstall-OneDriveGuard' -Action $guardAction -Trigger $guardTrigger -Principal $guardPrincipal -Settings $guardSettings -Force | Out-Null
+    Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $policy = Get-ItemProperty -LiteralPath $windowsPolicy -Name 'DisableFileSyncNGSC' -ErrorAction SilentlyContinue
+    $startup = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'OneDrive' -ErrorAction SilentlyContinue
+    $guardTask = Get-ScheduledTask -TaskName 'KlpInstall-OneDriveGuard' -ErrorAction SilentlyContinue
+    if ($policy.DisableFileSyncNGSC -ne 1 -or $startup.OneDrive -or -not $guardTask) { return 'VERIFICATION_FAILED' }
+    $script:RebootRequired = $true
+    Write-Ok 'OneDrive is uninstalled and blocked by policy'
+    Write-Info 'Existing OneDrive files were preserved'
+    return 'OK'
+}
+
+function Set-PageFileLocation {
+    $memoryKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+    $backupPath = Join-Path $Layout.Backups "memory-management_$(Get-Date -Format 'yyyyMMdd_HHmmss').reg"
+    Export-RegistryKey 'HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' $backupPath | Out-Null
+    $ramMB = [math]::Ceiling((Get-CimInstance -ClassName Win32_ComputerSystem).TotalPhysicalMemory / 1MB)
+    $initialMB = [int][math]::Min([math]::Max([math]::Ceiling(($ramMB * 0.5) / 1024) * 1024, 4096), 16384)
+    $maximumMB = [int][math]::Min([math]::Max([math]::Ceiling($ramMB / 1024) * 1024, 8192), 32768)
+    if ($maximumMB -lt $initialMB) { $maximumMB = $initialMB }
+    $driveRoot = [System.IO.Path]::GetPathRoot($Base).TrimEnd('\')
+    $pageFile = "$driveRoot\pagefile.sys"
+    $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+    if ($computerSystem.AutomaticManagedPagefile) {
+        Set-CimInstance -InputObject $computerSystem -Property @{ AutomaticManagedPagefile = $false } | Out-Null
+    }
+    Set-ItemProperty -LiteralPath $memoryKey -Name 'PagingFiles' -Value @("$pageFile $initialMB $maximumMB")
+    $configured = @((Get-ItemProperty -LiteralPath $memoryKey -Name 'PagingFiles').PagingFiles)
+    if (-not ($configured | Where-Object { $_ -like "$pageFile *" })) { return 'VERIFICATION_FAILED' }
+    $script:RebootRequired = $true
+    Write-Ok "Page file -> $pageFile ($initialMB-$maximumMB MB)"
+    return 'OK'
+}
+
+function Set-WindowsStoragePolicy {
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    Export-RegistryKey 'HKCU\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' (Join-Path $Layout.Backups "storage-sense_$stamp.reg") | Out-Null
+    Export-RegistryKey 'HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps' (Join-Path $Layout.Backups "local-dumps_$stamp.reg") | Out-Null
+    Export-RegistryKey 'HKLM\SYSTEM\CurrentControlSet\Control\CrashControl' (Join-Path $Layout.Backups "crash-control_$stamp.reg") | Out-Null
+    $storageSense = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy'
+    New-Item -Path $storageSense -Force | Out-Null
+    New-ItemProperty -Path $storageSense -Name '01' -Value 1 -PropertyType DWord -Force | Out-Null
+    $localDumps = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+    New-Item -Path $localDumps -Force | Out-Null
+    New-ItemProperty -Path $localDumps -Name 'DumpFolder' -Value $Layout.CrashDumps -PropertyType ExpandString -Force | Out-Null
+    New-ItemProperty -Path $localDumps -Name 'DumpCount' -Value 5 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $localDumps -Name 'DumpType' -Value 1 -PropertyType DWord -Force | Out-Null
+    $crashControl = 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl'
+    New-ItemProperty -Path $crashControl -Name 'DumpFile' -Value (Join-Path $Layout.CrashDumps 'MEMORY.DMP') -PropertyType ExpandString -Force | Out-Null
+    New-ItemProperty -Path $crashControl -Name 'MinidumpDir' -Value (Join-Path $Layout.CrashDumps 'Minidump') -PropertyType ExpandString -Force | Out-Null
+    & powercfg.exe /hibernate off 2>&1 | ForEach-Object { Add-Log "powercfg: $_" }
+    if ($LASTEXITCODE -ne 0) { return 'HIBERNATION_ERROR' }
+    Write-Ok 'Storage Sense is enabled, crash dumps use D:, hibernation is disabled'
+    return 'OK'
+}
+
+function Invoke-AppInstaller {
+    param([string]$Kind, [string]$InstallerPath, [string]$Target)
+    $filePath = $InstallerPath
+    $arguments = @()
+    switch ($Kind) {
+        'Python' { $arguments = @('/quiet', 'InstallAllUsers=1', "TargetDir=$Target", 'PrependPath=1', 'Include_launcher=1', 'InstallLauncherAllUsers=1', 'Include_test=0') }
+        'Firefox' { $arguments = @('/S', "/InstallDirectoryPath=$(Quote-Argument $Target)", '/DesktopShortcut=true', '/StartMenuShortcut=true', '/TaskbarShortcut=false', '/PrivateBrowsingShortcut=false', '/PreventRebootRequired=true') }
+        'Node' { $filePath = 'msiexec.exe'; $arguments = @('/i', (Quote-Argument $InstallerPath), '/qn', '/norestart', "INSTALLDIR=$(Quote-Argument $Target)") }
+        'VSCode' { $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS=!runcode', "/DIR=$(Quote-Argument $Target)") }
+        'Discord' { $arguments = @('/s') }
+        'Git' { $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL', '/SP-', "/DIR=$(Quote-Argument $Target)") }
+        'Telegram' { $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$(Quote-Argument $Target)") }
+        default { throw "Unknown installer type: $Kind" }
+    }
+    Add-Log "Starting installer: $filePath $($arguments -join ' ')"
+    $process = Start-Process -FilePath $filePath -ArgumentList $arguments -Wait -PassThru
+    Add-Log "Installer exit code: $($process.ExitCode)"
+    return $process.ExitCode -in @(0, 1641, 3010)
+}
+
+function Install-Application {
+    param([string]$Name, [hashtable]$Spec)
+    $target = Join-Path $Layout.Programs $Spec.Folder
+    if (Test-AppAtTarget -Spec $Spec -Target $target) { Write-Ok "$Name is already installed on D:"; return 'EXISTS' }
+    if (Test-WingetPackageInstalled -Id $Spec.Id) { Write-Warn "$Name is installed outside $target. Existing installation was not moved."; return 'EXISTS_OUTSIDE_D_LAYOUT' }
+    if (-not (Initialize-AppStorage -Name $Name -ProgramTarget $target)) { Write-Warn "$Name was skipped because existing profile data must be moved manually"; return 'EXISTING_DATA_ON_C' }
+    $downloadDirectory = Join-Path $Layout.Installers ($Spec.Id -replace '[^A-Za-z0-9._-]', '_')
+    $installerPath = Download-WingetInstaller -Id $Spec.Id -Scope $Spec.Scope -Destination $downloadDirectory
+    if (-not $installerPath) { return 'DOWNLOAD_FAILED' }
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+    if (-not (Invoke-AppInstaller -Kind $Spec.Installer -InstallerPath $installerPath -Target $target)) { Write-Fail "$Name installer returned an error"; return 'INSTALLER_FAILED' }
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        if (Test-AppAtTarget -Spec $Spec -Target $target) {
+            if ($Name -eq 'Firefox') { Set-FirefoxConfiguration -Target $target }
+            foreach ($relativePath in $Spec.PathFolders) {
+                $pathEntry = if ([string]::IsNullOrWhiteSpace($relativePath)) { $target } else { Join-Path $target $relativePath }
+                $pathTarget = if ($Spec.Scope -eq 'machine') { 'Machine' } else { 'User' }
+                Add-ToPath -Directory $pathEntry -Target $pathTarget
+            }
+            Refresh-Path
+            Write-Ok "$Name -> $target"
+            return 'OK'
+        }
+        Start-Sleep -Seconds 1
+    }
+    Write-Fail "$Name was not found in $target after installation"
+    return 'WRONG_LOCATION'
+}
+
+function Install-Chocolatey {
+    $target = Join-Path $Layout.Programs 'Chocolatey'
+    $executable = Join-Path $target 'bin\choco.exe'
+    Set-PersistentEnvironment -Name 'ChocolateyInstall' -Value $target -Target 'Machine'
+    if (Test-Path -LiteralPath $executable -PathType Leaf) { Add-ToPath (Split-Path -Parent $executable) Machine; Refresh-Path; Write-Ok "Chocolatey -> $target"; return 'EXISTS' }
+    if ((Test-Path -LiteralPath $target) -and (Get-ChildItem -LiteralPath $target -Force | Select-Object -First 1)) { Write-Warn "Chocolatey target is not empty: $target"; return 'TARGET_NOT_EMPTY' }
+    $scriptPath = Join-Path $Layout.Installers 'Chocolatey\install.ps1'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $scriptPath) -Force | Out-Null
+    Invoke-DownloadFile -Uri 'https://community.chocolatey.org/install.ps1' -Destination $scriptPath -TimeoutSec 120
+    Write-Ok "Downloaded to $scriptPath"
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { Write-Fail 'Chocolatey installation failed'; return 'INSTALLER_FAILED' }
+    Add-ToPath (Split-Path -Parent $executable) Machine
+    Refresh-Path
+    & $executable config set cacheLocation $Layout.ChocolateyCache --limit-output | Out-Null
+    Write-Ok "Chocolatey -> $target"
+    return 'OK'
+}
+
+function Install-Spotify {
+    $target = Join-Path $Layout.Programs 'Spotify'
+    if (-not (Initialize-AppStorage 'Spotify' $target)) { Write-Warn 'Spotify profile data already exists on C:'; return 'EXISTING_DATA_ON_C' }
+    $choco = Join-Path $Layout.Programs 'Chocolatey\bin\choco.exe'
+    if (-not (Test-Path -LiteralPath $choco -PathType Leaf)) { return 'NO_CHOCOLATEY' }
+    & $choco install spotify -y --no-progress --limit-output
+    if ($LASTEXITCODE -notin @(0, 1641, 3010)) { return 'INSTALLER_FAILED' }
+    if (-not (Get-ChildItem -LiteralPath $target -Recurse -File -Filter 'Spotify.exe' -ErrorAction SilentlyContinue | Select-Object -First 1)) { return 'WRONG_LOCATION' }
+    Write-Ok "Spotify -> $target"
+    return 'OK'
+}
+
+function Install-Rust {
+    $rustRoot = Join-Path $Layout.Programs 'Rust'
+    $rustupHome = $Layout.RustupHome
+    $cargoHome = $Layout.CargoHome
+    $installerPath = Join-Path $Layout.Installers 'Rust\rustup-init.exe'
+    Set-PersistentEnvironment 'RUSTUP_HOME' $rustupHome User
+    Set-PersistentEnvironment 'CARGO_HOME' $cargoHome User
+    if (Test-Path -LiteralPath (Join-Path $cargoHome 'bin\rustc.exe') -PathType Leaf) { Add-ToPath (Join-Path $cargoHome 'bin') User; Refresh-Path; return 'EXISTS' }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $installerPath) -Force | Out-Null
+    $rustTarget = if ($Architecture -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+    Invoke-DownloadFile -Uri "https://static.rust-lang.org/rustup/dist/$rustTarget/rustup-init.exe" -Destination $installerPath
+    Write-Ok "Downloaded to $installerPath"
+    $process = Start-Process -FilePath $installerPath -ArgumentList @('-y', '--no-modify-path') -Wait -PassThru
+    if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $cargoHome 'bin\rustc.exe') -PathType Leaf)) { return 'INSTALLER_FAILED' }
+    Add-ToPath (Join-Path $cargoHome 'bin') User
+    Refresh-Path
+    Write-Ok "Rust -> $rustRoot"
+    return 'OK'
+}
+
+function Install-NpmTools {
+    $prefix = $Layout.NpmGlobal
+    $cache = $Layout.NpmCache
+    New-Item -ItemType Directory -Path $prefix, $cache, $Layout.PnpmHome, $Layout.PnpmStore -Force | Out-Null
+    Set-PersistentEnvironment 'NPM_CONFIG_PREFIX' $prefix User
+    Set-PersistentEnvironment 'NPM_CONFIG_CACHE' $cache User
+    Add-ToPath $prefix User
+    Add-ToPath $Layout.PnpmHome User
+    Refresh-Path
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { return 'NO_NPM' }
+    & npm config set prefix $prefix --location=user
+    if ($LASTEXITCODE -ne 0) { return 'NPM_CONFIG_FAILED' }
+    & npm config set cache $cache --location=user
+    if ($LASTEXITCODE -ne 0) { return 'NPM_CONFIG_FAILED' }
+    & npm install --global pnpm
+    if ($LASTEXITCODE -ne 0) { return 'INSTALLER_FAILED' }
+    Refresh-Path
+    if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) { return 'NOT_IN_PATH' }
+    & pnpm config set store-dir $Layout.PnpmStore --global
+    if ($LASTEXITCODE -ne 0) { return 'PNPM_CONFIG_FAILED' }
+    Write-Ok "pnpm -> $prefix"
+    return 'OK'
+}
+
+function Install-TelegramProxy {
+    $target = Join-Path $Layout.Programs 'TelegramProxy'
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+    try {
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Flowseal/tg-ws-proxy/releases/latest' -TimeoutSec 30
+        $asset = $release.assets | Where-Object { $_.name -match '(?i)(windows|win).*(x64|amd64).*\.exe$|(?i)(x64|amd64).*(windows|win).*\.exe$' } | Select-Object -First 1
+        if (-not $asset) { $asset = $release.assets | Where-Object { $_.name -match '(?i)\.exe$' } | Select-Object -First 1 }
+        if (-not $asset) { return 'NO_WINDOWS_ASSET' }
+        $destination = Join-Path $target $asset.name
+        Invoke-DownloadFile -Uri $asset.browser_download_url -Destination $destination
+        if (-not (Test-Path -LiteralPath $destination -PathType Leaf) -or (Get-Item -LiteralPath $destination).Length -eq 0) { return 'DOWNLOAD_FAILED' }
+        Write-Ok "tg-ws-proxy -> $destination"
+        return 'OK'
+    } catch { Write-Fail $_.Exception.Message; return 'DOWNLOAD_FAILED' }
 }
 
 function Select-Components {
-    Write-Section 'Component Selection'
-
-    $components = [ordered]@{}
-
-    Write-Host '  Choose what to install:' -ForegroundColor Yellow
+    $selection = [ordered]@{}
+    Write-Section 'Component selection'
+    foreach ($name in $AppSpecs.Keys) { $selection[$name] = if ($SkipApplications) { $false } else { Prompt-YesNo "Install $name?" } }
+    $selection['Chocolatey'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Install Chocolatey?' }
+    $selection['Spotify'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Install Spotify?' }
+    $selection['Rust'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Install Rust?' $false }
+    $selection['npm_tools'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Install pnpm?' }
+    $selection['tg_proxy'] = if ($SkipApplications) { $false } else { Prompt-YesNo 'Download tg-ws-proxy?' $false }
+    $selection['KnownFolders'] = Prompt-YesNo 'Move Desktop, Documents, Downloads, Pictures, Music, Videos and Saved Games to D:?'
+    $selection['DisableOneDrive'] = Prompt-YesNo 'Uninstall and permanently block OneDrive?'
+    $selection['BrowserDownloads'] = Prompt-YesNo 'Force browser downloads, profiles and caches to D:?'
+    $selection['WindowsStorage'] = Prompt-YesNo 'Move the page file to D: and disable hibernation?'
+    if ($selection['DisableOneDrive']) { $selection['KnownFolders'] = $true }
+    if ($selection['Spotify']) { $selection['Chocolatey'] = $true }
     Write-Host ''
-
-    foreach ($key in $WINGET_APPS.Keys) {
-        $components[$key] = Prompt-YesNo "Install ${key}?"
+    Write-Host '  Installation set:' -ForegroundColor Cyan
+    foreach ($name in $selection.Keys) {
+        $mark = if ($selection[$name]) { '[+]' } else { '[-]' }
+        $color = if ($selection[$name]) { 'Green' } else { 'DarkGray' }
+        Write-Host "  $mark $name" -ForegroundColor $color
     }
-
-    Write-Host ''
-
-    $components['Chocolatey'] = Prompt-YesNo 'Install Chocolatey?'
-    $components['Spotify']    = Prompt-YesNo 'Install Spotify (via Chocolatey)?'
-    $components['Rust']       = Prompt-YesNo 'Install Rust?'
-    $components['npm_tools']  = Prompt-YesNo 'Install npm global tools (pnpm)?'
-    $components['tg_proxy']   = Prompt-YesNo 'Download tg-ws-proxy?'
-
-    Write-Host ''
-    Write-Host '  Selected:' -ForegroundColor Cyan
-    foreach ($key in $components.Keys) {
-        if ($components[$key]) {
-            Write-Host "    [+] $key" -ForegroundColor Green
-        } else {
-            Write-Host "    [-] $key" -ForegroundColor DarkGray
-        }
-    }
-    Write-Host ''
-
-    return $components
+    return $selection
 }
 
-# ── Main ────────────────────────────────────────────────────────────────────
+function Show-Plan {
+    Write-Section 'Storage plan'
+    foreach ($key in $Layout.Keys) { Write-Host "  $($key.PadRight(16)) $($Layout[$key])" }
+    Write-Host ''
+    Write-Host '  Existing personal files are copied to D: and preserved at the source.' -ForegroundColor Yellow
+    Write-Host '  OneDrive is disabled only after known folders are redirected.' -ForegroundColor Yellow
+    Write-Host '  Windows, WinGet itself, drivers and small system metadata remain on C:.' -ForegroundColor Yellow
+    Write-Host '  Existing non-empty application folders on C: are never moved automatically.' -ForegroundColor Yellow
+}
+
+function Show-Report {
+    Write-Section 'Installation report'
+    $ok = 0; $failed = 0; $skipped = 0
+    foreach ($name in $Results.Keys) {
+        $status = $Results[$name]
+        if ($status -in @('OK', 'EXISTS', 'CONFIGURED')) { Write-Host "  [OK]   $name - $status" -ForegroundColor Green; $ok++ }
+        elseif ($status -eq 'SKIP') { Write-Host "  [SKIP] $name" -ForegroundColor DarkGray; $skipped++ }
+        else { Write-Host "  [FAIL] $name - $status" -ForegroundColor Red; $failed++ }
+    }
+    $elapsed = (Get-Date) - $StartTime
+    Write-Host ''
+    Write-Host "  Successful: $ok  Failed: $failed  Skipped: $skipped"
+    Write-Host "  Time: $($elapsed.ToString('hh\:mm\:ss'))"
+    Write-Host "  Log: $LogFile"
+    if ($RebootRequired) { Write-Host '  Restart Windows to finish applying storage and OneDrive policies.' -ForegroundColor Yellow }
+    return $failed
+}
+
+function Test-FinalConfiguration {
+    $checks = [ordered]@{}
+    foreach ($entry in $StorageEnvironment.GetEnumerator()) {
+        $actual = [Environment]::GetEnvironmentVariable($entry.Key, 'User')
+        $checks["Environment:$($entry.Key)"] = $actual -ieq $entry.Value
+    }
+    foreach ($entry in $MachineEnvironment.GetEnumerator()) {
+        $actual = [Environment]::GetEnvironmentVariable($entry.Key, 'Machine')
+        $checks["MachineEnvironment:$($entry.Key)"] = $actual -ieq $entry.Value
+    }
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userPathParts = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    foreach ($directory in $PathDirectories) {
+        $checks["Path:$directory"] = [bool]($userPathParts | Where-Object { $_.TrimEnd('\') -ieq $directory.TrimEnd('\') })
+    }
+    if ($Components['KnownFolders']) {
+        Initialize-KnownFolderApi
+        foreach ($spec in $KnownFolderSpecs) {
+            $actual = [KlpKnownFolder]::Get($spec.Id)
+            $checks["KnownFolder:$($spec.Name)"] = $actual.TrimEnd('\') -ieq $Layout[$spec.LayoutKey].TrimEnd('\')
+        }
+    }
+    if ($Components['DisableOneDrive']) {
+        $policy = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' -ErrorAction SilentlyContinue
+        $machinePolicy = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' -ErrorAction SilentlyContinue
+        $userPolicy = Get-ItemProperty -LiteralPath 'HKCU:\SOFTWARE\Policies\Microsoft\OneDrive' -ErrorAction SilentlyContinue
+        $checks['OneDrive:Policy'] = $policy.DisableFileSyncNGSC -eq 1
+        $checks['OneDrive:KFM'] = $machinePolicy.KFMBlockOptIn -eq 1
+        $checks['OneDrive:AutoConfig'] = $machinePolicy.DisableAutoConfig -eq 3
+        $checks['OneDrive:PersonalSync'] = $userPolicy.DisablePersonalSync -eq 1
+        $checks['OneDrive:Process'] = -not [bool](Get-Process -Name OneDrive -ErrorAction SilentlyContinue)
+        $checks['OneDrive:Guard'] = [bool](Get-ScheduledTask -TaskName 'KlpInstall-OneDriveGuard' -ErrorAction SilentlyContinue)
+        $checks['OneDrive:GuardFile'] = Test-Path -LiteralPath (Join-Path $env:ProgramData 'KlpInstall\OneDriveGuard.ps1') -PathType Leaf
+    }
+    if ($Components['BrowserDownloads']) {
+        $edge = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -ErrorAction SilentlyContinue
+        $checks['Browser:Downloads'] = $edge.DownloadDirectory -ieq $Layout.Downloads
+        $checks['Browser:EdgeProfile'] = $edge.UserDataDir -ieq $BrowserPolicyPaths.EdgeProfile
+        $checks['Browser:EdgeCache'] = $edge.DiskCacheDir -ieq $BrowserPolicyPaths.EdgeCache
+        $chrome = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Google\Chrome' -ErrorAction SilentlyContinue
+        $checks['Browser:ChromeProfile'] = $chrome.UserDataDir -ieq $BrowserPolicyPaths.ChromeProfile
+        $checks['Browser:ChromeCache'] = $chrome.DiskCacheDir -ieq $BrowserPolicyPaths.ChromeCache
+    }
+    if ($Components['WindowsStorage']) {
+        $memoryManagement = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+        $pageFile = @($memoryManagement.PagingFiles)
+        $dataRoot = [System.IO.Path]::GetPathRoot($Base).TrimEnd('\')
+        $checks['Windows:PageFile'] = [bool]($pageFile | Where-Object { $_ -like "$dataRoot\pagefile.sys *" })
+        $power = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -ErrorAction SilentlyContinue
+        $checks['Windows:Hibernation'] = $power.HibernateEnabled -eq 0
+        $storageSense = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' -ErrorAction SilentlyContinue
+        $checks['Windows:StorageSense'] = $storageSense.'01' -eq 1
+        $localDumps = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps' -ErrorAction SilentlyContinue
+        $checks['Windows:LocalDumps'] = $localDumps.DumpFolder -ieq $Layout.CrashDumps
+        $crashControl = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction SilentlyContinue
+        $checks['Windows:CrashDump'] = $crashControl.DumpFile -ieq (Join-Path $Layout.CrashDumps 'MEMORY.DMP')
+    }
+    foreach ($path in $Layout.Values) { $checks["Directory:$path"] = Test-Path -LiteralPath $path -PathType Container }
+    $failed = @($checks.GetEnumerator() | Where-Object { -not $_.Value })
+    $report = [ordered]@{
+        Timestamp = (Get-Date).ToString('o')
+        ScriptVersion = $ScriptVersion
+        SystemDriveFreeGB = Get-FreeSpaceGB ([System.IO.Path]::GetPathRoot($env:SystemRoot))
+        DataDriveFreeGB = Get-FreeSpaceGB $Base
+        RebootRequired = $RebootRequired
+        Checks = $checks
+    }
+    $reportPath = Join-Path $Layout.Logs "verification_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+    $report | ConvertTo-Json -Depth 6 | Out-File -LiteralPath $reportPath -Encoding UTF8
+    if ($failed.Count -gt 0) {
+        foreach ($item in $failed) { Write-Fail "Verification: $($item.Key)" }
+        Write-Info "Verification report -> $reportPath"
+        return 'VERIFICATION_FAILED'
+    }
+    Write-Ok "All storage paths verified -> $reportPath"
+    return 'OK'
+}
 
 Write-Banner
-
-# ── Internet check ──────────────────────────────────────────────────────────
-
-Write-Section 'Pre-flight Checks'
-if (-not (Test-Internet)) {
-    Write-Fail 'No internet connection detected'
-    Read-Host '  Enter to exit'
+try {
+    Assert-SupportedSystem
+    $Base = Get-FullBasePath -Path $BasePath
+} catch {
+    Write-Fail $_.Exception.Message
+    if (-not $Silent) { Read-Host '  Enter to exit' }
     exit 1
 }
-Write-Ok 'Internet connection'
 
-# ── Base path ───────────────────────────────────────────────────────────────
-
-if (-not $BasePath) {
-    Write-Host '  Base path [Enter = D:\]: ' -ForegroundColor Yellow -NoNewline
-    $inputPath = Read-Host
-    if ([string]::IsNullOrWhiteSpace($inputPath)) { $inputPath = 'D:\' }
-    $BASE = $inputPath.TrimEnd('\')
-} else {
-    $BASE = $BasePath.TrimEnd('\')
+$currentProfileName = [Environment]::UserName
+$Layout = [ordered]@{
+    Programs = Join-Path $Base 'Program'
+    AppData = Join-Path $Base 'AppData'
+    Desktop = Join-Path $Base 'Desktop'
+    Documents = Join-Path $Base 'Documents'
+    Downloads = Join-Path $Base 'Downloads'
+    Pictures = Join-Path $Base 'Pictures'
+    Music = Join-Path $Base 'Music'
+    Videos = Join-Path $Base 'Videos'
+    SavedGames = Join-Path $Base 'Games\Saved Games'
+    Screenshots = Join-Path $Base 'Pictures\Screenshots'
+    CameraRoll = Join-Path $Base 'Pictures\Camera Roll'
+    Projects = Join-Path $Base 'Project'
+    Games = Join-Path $Base 'Games'
+    Models = Join-Path $Base 'Models'
+    InstallerRoot = Join-Path $Base 'KlpInstall'
+    Installers = Join-Path $Base 'Downloads\Installers'
+    UserTemp = Join-Path $Base 'KlpInstall\Temp\User'
+    SystemTemp = Join-Path $Base 'KlpInstall\Temp\System'
+    Cache = Join-Path $Base 'KlpInstall\Cache'
+    PipCache = Join-Path $Base 'KlpInstall\Cache\pip'
+    NuGetCache = Join-Path $Base 'KlpInstall\Cache\NuGet'
+    NpmCache = Join-Path $Base 'KlpInstall\Cache\npm'
+    NpmGlobal = Join-Path $Base 'AppData\npm'
+    PnpmHome = Join-Path $Base 'AppData\pnpm'
+    PnpmStore = Join-Path $Base 'KlpInstall\Cache\pnpm-store'
+    CorepackHome = Join-Path $Base 'KlpInstall\Cache\Corepack'
+    YarnCache = Join-Path $Base 'KlpInstall\Cache\Yarn'
+    RustupHome = Join-Path $Base 'Program\Rust\rustup'
+    CargoHome = Join-Path $Base 'Program\Rust\cargo'
+    PythonUserBase = Join-Path $Base 'AppData\Python'
+    PipxHome = Join-Path $Base 'AppData\Python\pipx'
+    PipxBin = Join-Path $Base 'AppData\Python\pipx-bin'
+    PoetryCache = Join-Path $Base 'KlpInstall\Cache\Poetry'
+    DotnetHome = Join-Path $Base 'AppData\dotnet'
+    DotnetTools = Join-Path $Base 'AppData\dotnet-tools'
+    GoHome = Join-Path $Base 'AppData\Go'
+    GoCache = Join-Path $Base 'KlpInstall\Cache\Go\Build'
+    GoModules = Join-Path $Base 'KlpInstall\Cache\Go\Modules'
+    GradleHome = Join-Path $Base 'KlpInstall\Cache\Gradle'
+    UvCache = Join-Path $Base 'KlpInstall\Cache\uv'
+    BunHome = Join-Path $Base 'AppData\Bun'
+    XdgCache = Join-Path $Base 'KlpInstall\Cache\XDG'
+    HuggingFaceCache = Join-Path $Base 'KlpInstall\Cache\HuggingFace'
+    TorchCache = Join-Path $Base 'KlpInstall\Cache\Torch'
+    CudaCache = Join-Path $Base 'KlpInstall\Cache\CUDA'
+    OllamaModels = Join-Path $Base 'Models\Ollama'
+    PlaywrightCache = Join-Path $Base 'KlpInstall\Cache\Playwright'
+    PuppeteerCache = Join-Path $Base 'KlpInstall\Cache\Puppeteer'
+    CypressCache = Join-Path $Base 'KlpInstall\Cache\Cypress'
+    ElectronCache = Join-Path $Base 'KlpInstall\Cache\Electron'
+    ElectronBuilderCache = Join-Path $Base 'KlpInstall\Cache\ElectronBuilder'
+    VcpkgCache = Join-Path $Base 'KlpInstall\Cache\vcpkg'
+    Ccache = Join-Path $Base 'KlpInstall\Cache\ccache'
+    Sccache = Join-Path $Base 'KlpInstall\Cache\sccache'
+    AndroidSdk = Join-Path $Base 'AppData\Android\Sdk'
+    CodexHome = Join-Path $Base 'AppData\Codex'
+    EdgeProfile = Join-Path $Base "AppData\Browsers\$currentProfileName\Edge\User Data"
+    EdgeCache = Join-Path $Base "KlpInstall\Cache\Browsers\$currentProfileName\Edge"
+    ChromeProfile = Join-Path $Base "AppData\Browsers\$currentProfileName\Chrome\User Data"
+    ChromeCache = Join-Path $Base "KlpInstall\Cache\Browsers\$currentProfileName\Chrome"
+    ChocolateyCache = Join-Path $Base 'KlpInstall\Cache\Chocolatey'
+    CrashDumps = Join-Path $Base 'KlpInstall\CrashDumps'
+    Logs = Join-Path $Base 'KlpInstall\Logs'
+    Backups = Join-Path $Base 'KlpInstall\Backups'
 }
 
-$driveLetter = $BASE.Substring(0, 1)
-if (-not (Test-Path "${driveLetter}:\")) {
-    Write-Fail "Drive ${driveLetter}: does not exist"
-    Read-Host '  Enter to exit'
+$BrowserPolicyPaths = [ordered]@{
+    EdgeProfile = Join-Path $Base 'AppData\Browsers\${user_name}\Edge\User Data'
+    EdgeCache = Join-Path $Base 'KlpInstall\Cache\Browsers\${user_name}\Edge'
+    ChromeProfile = Join-Path $Base 'AppData\Browsers\${user_name}\Chrome\User Data'
+    ChromeCache = Join-Path $Base 'KlpInstall\Cache\Browsers\${user_name}\Chrome'
+}
+
+$KnownFolderSpecs = @(
+    @{ Name = 'Desktop'; Id = 'B4BFCC3A-DB2C-424C-B029-7FE99A87C641'; LayoutKey = 'Desktop' },
+    @{ Name = 'Documents'; Id = 'FDD39AD0-238F-46AF-ADB4-6C85480369C7'; LayoutKey = 'Documents' },
+    @{ Name = 'Downloads'; Id = '374DE290-123F-4565-9164-39C4925E467B'; LayoutKey = 'Downloads' },
+    @{ Name = 'Pictures'; Id = '33E28130-4E1E-4676-835A-98395C3BC3BB'; LayoutKey = 'Pictures' },
+    @{ Name = 'Music'; Id = '4BD8D571-6D19-48D3-BE97-422220080E43'; LayoutKey = 'Music' },
+    @{ Name = 'Videos'; Id = '18989B1D-99B5-455B-841C-AB7C74E4DDFC'; LayoutKey = 'Videos' },
+    @{ Name = 'Saved Games'; Id = '4C5C32FF-BB9D-43B0-B5B4-2D72E54EAAA4'; LayoutKey = 'SavedGames' },
+    @{ Name = 'Screenshots'; Id = 'B7BEDE81-DF94-4682-A7D8-57A52620B86F'; LayoutKey = 'Screenshots' },
+    @{ Name = 'Camera Roll'; Id = 'AB5FB87B-7CE2-4F83-915D-550846C9537B'; LayoutKey = 'CameraRoll' }
+)
+
+$StorageEnvironment = [ordered]@{
+    TEMP = $Layout.UserTemp
+    TMP = $Layout.UserTemp
+    TMPDIR = $Layout.UserTemp
+    PIP_CACHE_DIR = $Layout.PipCache
+    PYTHONUSERBASE = $Layout.PythonUserBase
+    NUGET_PACKAGES = $Layout.NuGetCache
+    NPM_CONFIG_PREFIX = $Layout.NpmGlobal
+    NPM_CONFIG_CACHE = $Layout.NpmCache
+    NPM_CONFIG_USERCONFIG = Join-Path $Layout.NpmGlobal '.npmrc'
+    PNPM_HOME = $Layout.PnpmHome
+    COREPACK_HOME = $Layout.CorepackHome
+    YARN_CACHE_FOLDER = $Layout.YarnCache
+    RUSTUP_HOME = $Layout.RustupHome
+    CARGO_HOME = $Layout.CargoHome
+    PIPX_HOME = $Layout.PipxHome
+    PIPX_BIN_DIR = $Layout.PipxBin
+    POETRY_CACHE_DIR = $Layout.PoetryCache
+    DOTNET_CLI_HOME = $Layout.DotnetHome
+    DOTNET_BUNDLE_EXTRACT_BASE_DIR = Join-Path $Layout.UserTemp 'dotnet-bundle'
+    GOPATH = $Layout.GoHome
+    GOCACHE = $Layout.GoCache
+    GOMODCACHE = $Layout.GoModules
+    GRADLE_USER_HOME = $Layout.GradleHome
+    UV_CACHE_DIR = $Layout.UvCache
+    BUN_INSTALL = $Layout.BunHome
+    XDG_CACHE_HOME = $Layout.XdgCache
+    HF_HOME = $Layout.HuggingFaceCache
+    TORCH_HOME = $Layout.TorchCache
+    CUDA_CACHE_PATH = $Layout.CudaCache
+    OLLAMA_MODELS = $Layout.OllamaModels
+    PLAYWRIGHT_BROWSERS_PATH = $Layout.PlaywrightCache
+    PUPPETEER_CACHE_DIR = $Layout.PuppeteerCache
+    CYPRESS_CACHE_FOLDER = $Layout.CypressCache
+    ELECTRON_CACHE = $Layout.ElectronCache
+    ELECTRON_BUILDER_CACHE = $Layout.ElectronBuilderCache
+    VCPKG_DEFAULT_BINARY_CACHE = $Layout.VcpkgCache
+    CCACHE_DIR = $Layout.Ccache
+    SCCACHE_DIR = $Layout.Sccache
+    ANDROID_HOME = $Layout.AndroidSdk
+    ANDROID_SDK_ROOT = $Layout.AndroidSdk
+    CODEX_HOME = $Layout.CodexHome
+}
+
+$MachineEnvironment = [ordered]@{
+    TEMP = $Layout.SystemTemp
+    TMP = $Layout.SystemTemp
+}
+
+$PathDirectories = @(
+    $Layout.NpmGlobal,
+    $Layout.PnpmHome,
+    $Layout.PipxBin,
+    (Join-Path $Layout.CargoHome 'bin'),
+    (Join-Path $Layout.BunHome 'bin'),
+    $Layout.DotnetTools,
+    (Join-Path $Layout.GoHome 'bin')
+)
+
+$Architecture = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+$Components = Select-Components
+Show-Plan
+if ($PlanOnly) { Write-Info 'PlanOnly completed without changing the system'; if (-not $Silent) { Read-Host '  Enter to exit' }; exit 0 }
+if (-not (Prompt-YesNo 'Apply this storage plan?')) { Write-Info 'Cancelled'; exit 0 }
+
+Write-Section 'Pre-flight checks'
+try {
+    $volume = Get-DataVolume -Path $Base
+    Write-Ok "$($volume.DeviceID) is a fixed NTFS drive"
+} catch {
+    Write-Fail $_.Exception.Message
+    if (-not $Silent) { Read-Host '  Enter to exit' }
     exit 1
 }
-Write-Ok "Base path: $BASE"
-
-# ── Disk space ──────────────────────────────────────────────────────────────
-
-$diskCheck = Test-DiskSpace $BASE $MIN_DISK_SPACE_GB
-if ($diskCheck.FreeGB -ge 0) {
-    if ($diskCheck.OK) {
-        Write-Ok "Disk space: $($diskCheck.FreeGB) GB free"
-    } else {
-        Write-Warn "Low disk space: $($diskCheck.FreeGB) GB (need $MIN_DISK_SPACE_GB GB)"
-        if (-not (Prompt-YesNo 'Continue anyway?')) { exit 1 }
-    }
+$freeSpace = Get-FreeSpaceGB -Path $Base
+if ($freeSpace -lt $MinimumFreeSpaceGB) { Write-Warn "Only $freeSpace GB is free on $([System.IO.Path]::GetPathRoot($Base))"; if (-not (Prompt-YesNo 'Continue with low free space?' $false)) { exit 1 } } else { Write-Ok "$freeSpace GB is free on $([System.IO.Path]::GetPathRoot($Base))" }
+$systemDrive = [System.IO.Path]::GetPathRoot($env:SystemRoot)
+$systemFreeSpace = Get-FreeSpaceGB -Path $systemDrive
+if ($systemFreeSpace -lt 10) { Write-Warn "The system drive has only $systemFreeSpace GB free. This setup prevents new growth but does not delete existing data." } else { Write-Info "$systemFreeSpace GB is free on the system drive" }
+$internetRequired = $false
+foreach ($name in $AppSpecs.Keys) { if ($Components[$name]) { $internetRequired = $true } }
+foreach ($name in @('Chocolatey', 'Spotify', 'Rust', 'npm_tools', 'tg_proxy')) { if ($Components[$name]) { $internetRequired = $true } }
+if ($internetRequired) {
+    if (-not (Test-Internet)) { Write-Fail 'Internet connection is unavailable'; if (-not $Silent) { Read-Host '  Enter to exit' }; exit 1 }
+    Write-Ok 'Internet connection'
 }
 
-# ── Winget check ────────────────────────────────────────────────────────────
+foreach ($directory in $Layout.Values) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+foreach ($directory in $PathDirectories) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+$LogFile = Join-Path $Layout.Logs "setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+Add-Log "Setup started, version $ScriptVersion, base path $Base"
+$aclOutput = & icacls.exe $Layout.SystemTemp /inheritance:e /grant '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-11:(OI)(CI)M' 2>&1
+$aclExitCode = $LASTEXITCODE
+$aclOutput | ForEach-Object { Add-Log "icacls: $_" }
+if ($aclExitCode -ne 0) { Write-Fail 'Could not configure permissions for the system temporary directory'; if (-not $Silent) { Read-Host '  Enter to exit' }; exit 1 }
+Write-Ok "System temporary directory permissions -> $($Layout.SystemTemp)"
 
-$hasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
-if ($hasWinget) {
-    Write-Ok 'winget available'
-    winget source update 2>&1 | Out-Null
-} else {
-    Write-Warn 'winget not found - winget-based installs will be skipped'
-}
-
-# ── Component selection ─────────────────────────────────────────────────────
-
-$components = Select-Components
-
-# ── Create folders ──────────────────────────────────────────────────────────
-
-Write-Section 'Folder Structure'
-foreach ($f in $FOLDERS) {
-    $p = "$BASE\$f"
-    if (-not (Test-Path $p)) {
-        New-Item -ItemType Directory -Path $p -Force | Out-Null
-        Write-Host '    ' -NoNewline; Write-Host '+' -ForegroundColor Green -NoNewline; Write-Host " $p"
-    } else {
-        Write-Host '    ' -NoNewline; Write-Host '~' -ForegroundColor DarkGray -NoNewline; Write-Host " $p (exists)"
-    }
-}
-
-# ── Init log ────────────────────────────────────────────────────────────────
-
-$LogFile = "$BASE\Download\setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-Add-Log "Setup started - Base: $BASE"
-Add-Log "Script version: $SCRIPT_VERSION"
-Add-Log "OS: $([System.Environment]::OSVersion.VersionString)"
-
-# ── Backup PATH ─────────────────────────────────────────────────────────────
-
-Backup-PathVariable
-
-# ── Count steps ─────────────────────────────────────────────────────────────
-
-$totalSteps = ($components.Values | Where-Object { $_ }).Count
-$currentStep = 0
-
-# ── tg-ws-proxy ─────────────────────────────────────────────────────────────
-
-if ($components['tg_proxy']) {
-    $currentStep++
-    Write-ProgressStep $currentStep $totalSteps 'tg-ws-proxy'
-    Write-Section 'tg-ws-proxy'
-
-    $tgProxyDir = "$BASE\Telegram"
-    try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/Flowseal/tg-ws-proxy/releases/latest" -TimeoutSec 15
-        $asset = $release.assets | Where-Object {
-            $_.name -match 'windows|win' -or $_.name -match '\.exe$'
-        } | Select-Object -First 1
-
-        if ($asset) {
-            $proxyDest = "$tgProxyDir\$($asset.name)"
-            if (-not (Test-Path $proxyDest)) {
-                $dl = Download-File -Url $asset.browser_download_url -Dest $proxyDest -Label "tg-ws-proxy ($($asset.name))"
-                $Results['tg-ws-proxy'] = if ($dl) { 'OK' } else { 'Download failed' }
-            } else {
-                Write-Ok 'tg-ws-proxy (already downloaded)'
-                $Results['tg-ws-proxy'] = 'EXISTS'
-            }
-        } else {
-            Write-Warn 'tg-ws-proxy: no Windows binary in release'
-            $Results['tg-ws-proxy'] = 'No Windows asset'
-        }
-    } catch {
-        Write-Fail "tg-ws-proxy: $_"
-        $Results['tg-ws-proxy'] = "$_"
-    }
-} else {
-    $Results['tg-ws-proxy'] = 'SKIP'
-}
-
-# ── Winget apps ─────────────────────────────────────────────────────────────
-
-if ($hasWinget) {
-    Write-Section 'Winget Applications'
-    foreach ($appName in $WINGET_APPS.Keys) {
-        if ($components[$appName]) {
-            $currentStep++
-            Write-ProgressStep $currentStep $totalSteps $appName
-            Write-Host ''
-            $Results[$appName] = Install-WingetPackage $WINGET_APPS[$appName] $appName
-        } else {
-            $Results[$appName] = 'SKIP'
-        }
-    }
-} else {
-    foreach ($appName in $WINGET_APPS.Keys) {
-        if ($components[$appName]) {
-            $Results[$appName] = 'SKIP (no winget)'
-        } else {
-            $Results[$appName] = 'SKIP'
-        }
-    }
-}
-
+Write-Section 'Persistent storage locations'
+Export-EnvironmentState
+foreach ($entry in $StorageEnvironment.GetEnumerator()) { Set-PersistentEnvironment -Name $entry.Key -Value $entry.Value -Target User }
+foreach ($entry in $MachineEnvironment.GetEnumerator()) { Set-PersistentEnvironment -Name $entry.Key -Value $entry.Value -Target Machine }
+$env:TEMP = $Layout.UserTemp
+$env:TMP = $Layout.UserTemp
+$env:TMPDIR = $Layout.UserTemp
+foreach ($directory in $PathDirectories) { Add-ToPath -Directory $directory -Target User }
 Refresh-Path
 
-# ── Chocolatey ──────────────────────────────────────────────────────────────
-
-if ($components['Chocolatey']) {
-    $currentStep++
-    Write-ProgressStep $currentStep $totalSteps 'Chocolatey'
-    Write-Section 'Chocolatey'
-
-    $chocoPath = "$BASE\Chocolatey"
-    [System.Environment]::SetEnvironmentVariable('ChocolateyInstall', $chocoPath, 'Machine')
-    $env:ChocolateyInstall = $chocoPath
-
-    if (Get-Command choco -ErrorAction SilentlyContinue) {
-        Write-Ok 'Chocolatey (already installed)'
-        $Results['Chocolatey'] = 'EXISTS'
-    } elseif (Test-Path "$chocoPath\bin\choco.exe") {
-        $env:Path = "$chocoPath\bin;$env:Path"
-        Write-Ok 'Chocolatey (recovered from path)'
-        $Results['Chocolatey'] = 'OK'
-    } else {
-        try {
-            if (Test-Path $chocoPath) { Remove-Item -Path $chocoPath -Recurse -Force -ErrorAction SilentlyContinue }
-            $installScript = (New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')
-            Invoke-Expression $installScript
-            Refresh-Path
-            $env:Path = "$chocoPath\bin;$env:Path"
-
-            if (Get-Command choco -ErrorAction SilentlyContinue) {
-                Write-Ok 'Chocolatey'
-                $Results['Chocolatey'] = 'OK'
-            } else {
-                Write-Fail 'Chocolatey (not found after install)'
-                $Results['Chocolatey'] = 'Post-install check failed'
-            }
-        } catch {
-            Write-Fail "Chocolatey: $_"
-            $Results['Chocolatey'] = "$_"
-        }
-    }
+Write-Section 'Windows folders and storage'
+if ($Components['KnownFolders']) {
+    try { $Results['Known folders'] = Set-KnownFolderLayout } catch { Write-Fail "Known folders: $($_.Exception.Message)"; $Results['Known folders'] = 'ERROR' }
+} else { $Results['Known folders'] = 'SKIP' }
+if ($Components['BrowserDownloads']) {
+    try { $Results['Browser downloads'] = Set-BrowserDownloadPolicies } catch { Write-Fail "Browser downloads: $($_.Exception.Message)"; $Results['Browser downloads'] = 'ERROR' }
+} else { $Results['Browser downloads'] = 'SKIP' }
+if ($Components['WindowsStorage']) {
+    try { $Results['Page file'] = Set-PageFileLocation } catch { Write-Fail "Page file: $($_.Exception.Message)"; $Results['Page file'] = 'ERROR' }
+    try { $Results['Windows storage'] = Set-WindowsStoragePolicy } catch { Write-Fail "Windows storage: $($_.Exception.Message)"; $Results['Windows storage'] = 'ERROR' }
 } else {
-    $Results['Chocolatey'] = 'SKIP'
+    $Results['Page file'] = 'SKIP'
+    $Results['Windows storage'] = 'SKIP'
 }
 
-# ── Spotify ─────────────────────────────────────────────────────────────────
-
-if ($components['Spotify']) {
-    $currentStep++
-    Write-ProgressStep $currentStep $totalSteps 'Spotify'
-    Write-Section 'Spotify'
-
-    if (Get-Command choco -ErrorAction SilentlyContinue) {
-        try {
-            choco install spotify -y 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Ok 'Spotify'
-                $Results['Spotify'] = 'OK'
-            } else {
-                Write-Fail "Spotify (choco exit: $LASTEXITCODE)"
-                $Results['Spotify'] = "choco exit $LASTEXITCODE"
-            }
-        } catch {
-            Write-Fail "Spotify: $_"
-            $Results['Spotify'] = "$_"
-        }
-    } else {
-        Write-Warn 'Spotify: Chocolatey not available'
-        $Results['Spotify'] = 'No Chocolatey'
-    }
+$wingetRequired = $false
+foreach ($name in $AppSpecs.Keys) { if ($Components[$name]) { $wingetRequired = $true } }
+if ($wingetRequired) {
+    try { $Results['WinGet'] = Ensure-Winget } catch { Write-Fail "WinGet: $($_.Exception.Message)"; $Results['WinGet'] = 'ERROR' }
 } else {
-    $Results['Spotify'] = 'SKIP'
+    $script:WingetCommand = Resolve-WingetCommand
+    $Results['WinGet'] = 'SKIP'
 }
 
-# ── Rust ────────────────────────────────────────────────────────────────────
-
-if ($components['Rust']) {
-    $currentStep++
-    Write-ProgressStep $currentStep $totalSteps 'Rust'
-    Write-Section 'Rust'
-
-    $rustDir = "$BASE\Rust"
-    $rustupHome = "$rustDir\.rustup"
-    $cargoHome = "$rustDir\.cargo"
-    $rustupExe = "$BASE\Download\rustup-init.exe"
-
-    if (Get-Command rustc -ErrorAction SilentlyContinue) {
-        $ver = (rustc --version 2>&1) -replace 'rustc ',''
-        Write-Ok "Rust ($ver)"
-        $Results['Rust'] = 'EXISTS'
+if ($Components['DisableOneDrive']) {
+    if ($Results['Known folders'] -eq 'OK') {
+        try { $Results['OneDrive'] = Disable-OneDrive } catch { Write-Fail "OneDrive: $($_.Exception.Message)"; $Results['OneDrive'] = 'ERROR' }
     } else {
-        try {
-            if (-not (Test-Path $rustDir)) { New-Item -ItemType Directory -Path $rustDir -Force | Out-Null }
-
-            [System.Environment]::SetEnvironmentVariable('RUSTUP_HOME', $rustupHome, 'Machine')
-            [System.Environment]::SetEnvironmentVariable('CARGO_HOME', $cargoHome, 'Machine')
-            $env:RUSTUP_HOME = $rustupHome
-            $env:CARGO_HOME = $cargoHome
-
-            if (-not (Test-Path $rustupExe)) {
-                $dl = Download-File `
-                    -Url 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' `
-                    -Dest $rustupExe `
-                    -Label 'rustup-init'
-                if (-not $dl) { throw "Failed to download rustup-init.exe" }
-            }
-
-            Start-Process -FilePath $rustupExe -ArgumentList '-y','--no-modify-path' -Wait -NoNewWindow
-
-            Add-ToSystemPath "$cargoHome\bin" | Out-Null
-            Refresh-Path
-            $env:PATH = "$cargoHome\bin;$env:PATH"
-
-            if (Get-Command rustc -ErrorAction SilentlyContinue) {
-                $ver = (rustc --version 2>&1) -replace 'rustc ',''
-                Write-Ok "Rust ($ver)"
-                $Results['Rust'] = 'OK'
-            } else {
-                Write-Fail 'Rust (not found after install)'
-                $Results['Rust'] = 'Post-install check failed'
-            }
-        } catch {
-            Write-Fail "Rust: $_"
-            $Results['Rust'] = "$_"
-        }
+        Write-Fail 'OneDrive was not disabled because known-folder redirection failed'
+        $Results['OneDrive'] = 'KNOWN_FOLDER_FAILED'
     }
-} else {
-    $Results['Rust'] = 'SKIP'
+} else { $Results['OneDrive'] = 'SKIP' }
+
+Write-Section 'Applications'
+foreach ($name in $AppSpecs.Keys) {
+    if ($Components[$name]) {
+        if ($Results['WinGet'] -eq 'OK') {
+            try { $Results[$name] = Install-Application -Name $name -Spec $AppSpecs[$name] } catch { Write-Fail "${name}: $($_.Exception.Message)"; $Results[$name] = 'ERROR' }
+        } else {
+            $Results[$name] = 'NO_WINGET'
+        }
+    } else { $Results[$name] = 'SKIP' }
 }
 
-# ── npm tools ───────────────────────────────────────────────────────────────
+Write-Section 'Additional tools'
+if ($Components['Chocolatey']) { try { $Results['Chocolatey'] = Install-Chocolatey } catch { Write-Fail "Chocolatey: $($_.Exception.Message)"; $Results['Chocolatey'] = 'ERROR' } } else { $Results['Chocolatey'] = 'SKIP' }
+if ($Components['Spotify']) { try { $Results['Spotify'] = Install-Spotify } catch { Write-Fail "Spotify: $($_.Exception.Message)"; $Results['Spotify'] = 'ERROR' } } else { $Results['Spotify'] = 'SKIP' }
+if ($Components['Rust']) { try { $Results['Rust'] = Install-Rust } catch { Write-Fail "Rust: $($_.Exception.Message)"; $Results['Rust'] = 'ERROR' } } else { $Results['Rust'] = 'SKIP' }
+if ($Components['npm_tools']) { try { $Results['pnpm'] = Install-NpmTools } catch { Write-Fail "pnpm: $($_.Exception.Message)"; $Results['pnpm'] = 'ERROR' } } else { $Results['pnpm'] = 'SKIP' }
+if ($Components['tg_proxy']) { $Results['tg-ws-proxy'] = Install-TelegramProxy } else { $Results['tg-ws-proxy'] = 'SKIP' }
 
-if ($components['npm_tools']) {
-    $currentStep++
-    Write-ProgressStep $currentStep $totalSteps 'npm tools'
-    Write-Section 'npm Global Packages'
-
-    Refresh-Path
-
-    if (Get-Command npm -ErrorAction SilentlyContinue) {
-        $npmVer = (npm --version 2>&1)
-        Write-Info "npm $npmVer"
-
-        foreach ($pkg in $NPM_PACKAGES) {
-            try {
-                npm install -g $pkg 2>&1 | Out-Null
-                if (Get-Command $pkg -ErrorAction SilentlyContinue) {
-                    $pver = & $pkg --version 2>&1
-                    Write-Ok "$pkg ($pver)"
-                    $Results["npm:$pkg"] = 'OK'
-                } else {
-                    Write-Warn "$pkg (installed but not in PATH)"
-                    $Results["npm:$pkg"] = 'Not in PATH'
-                }
-            } catch {
-                Write-Fail "$pkg : $_"
-                $Results["npm:$pkg"] = "$_"
-            }
-        }
-    } else {
-        Write-Warn 'npm not found - install Node.js first'
-        foreach ($pkg in $NPM_PACKAGES) { $Results["npm:$pkg"] = 'No npm' }
-    }
-} else {
-    foreach ($pkg in $NPM_PACKAGES) { $Results["npm:$pkg"] = 'SKIP' }
-}
-
-# ── Cleanup ─────────────────────────────────────────────────────────────────
-
-Write-Section 'Cleanup'
-$tempFiles = @("$BASE\Download\rustup-init.exe")
-foreach ($tf in $tempFiles) {
-    if (Test-Path $tf) {
-        if (Prompt-YesNo "Delete temp file $(Split-Path $tf -Leaf)?") {
-            Remove-Item $tf -Force -ErrorAction SilentlyContinue
-            Write-Ok "Deleted $tf"
-        }
-    }
-}
-
-# ── Report ──────────────────────────────────────────────────────────────────
-
-Write-Host ''
-Write-ProgressStep $totalSteps $totalSteps 'Done'
-Write-Host ''
-
-Show-Report
-
-Add-Log "Setup completed"
+Refresh-Path
+Write-Section 'Final verification'
+try { $Results['Configuration'] = Test-FinalConfiguration } catch { Write-Fail "Configuration: $($_.Exception.Message)"; $Results['Configuration'] = 'ERROR' }
+$failedCount = Show-Report
 Add-Log "Results: $($Results | Out-String)"
-
-Read-Host '  Enter to exit'
+if (-not $Silent) { Read-Host '  Enter to exit' }
+if ($failedCount -gt 0) { exit 1 }
+exit 0
