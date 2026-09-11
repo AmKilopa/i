@@ -23,6 +23,17 @@ jobs:
           $path = 'i.ps1'
           $text = Get-Content -LiteralPath $path -Raw
 
+          function Replace-OnceLiteral {
+              param(
+                  [string]$InputText,
+                  [string]$Pattern,
+                  [string]$Replacement
+              )
+              $match = [regex]::Match($InputText, $Pattern)
+              if (-not $match.Success) { throw "Patch target not found: $Pattern" }
+              return $InputText.Substring(0, $match.Index) + $Replacement + $InputText.Substring($match.Index + $match.Length)
+          }
+
           $text = $text -replace "(?m)^Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force\r?\n", ''
           $text = $text.Replace("`$ScriptVersion = '4.0.0'", "`$ScriptVersion = '4.1.0'")
 
@@ -58,8 +69,7 @@ jobs:
           }
           '@
           $pattern = '(?s)function Invoke-DownloadFile \{.*?\r?\n\}\r?\n\r?\nfunction Set-PersistentEnvironment'
-          if ($text -notmatch $pattern) { throw 'Invoke-DownloadFile block not found' }
-          $text = [regex]::Replace($text, $pattern, $downloadFunction + "`r`n`r`nfunction Set-PersistentEnvironment", 1)
+          $text = Replace-OnceLiteral -InputText $text -Pattern $pattern -Replacement ($downloadFunction + "`r`n`r`nfunction Set-PersistentEnvironment")
 
           $copyFunction = @'
           function Copy-KnownFolderContent {
@@ -67,10 +77,13 @@ jobs:
               if ([string]::IsNullOrWhiteSpace($Source) -or -not (Test-Path -LiteralPath $Source -PathType Container)) { return $true }
               if ([System.IO.Path]::GetFullPath($Source).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')) { return $true }
               Write-Info "Copying files: $Source -> $Destination"
-              Write-Host '       Robocopy progress will be shown below. Large folders can take several minutes.' -ForegroundColor DarkGray
-              & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /XO /R:2 /W:1 /ETA
+              Write-Host '       Robocopy progress is shown below. Large folders can take several minutes.' -ForegroundColor DarkGray
+              & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /XO /R:2 /W:1 /ETA 2>&1 | ForEach-Object {
+                  Write-Host $_
+                  Add-Log "robocopy: $_"
+              }
               $exitCode = $LASTEXITCODE
-              Add-Log "robocopy exit $exitCode: $Source -> $Destination"
+              Add-Log "robocopy exit ${exitCode}: $Source -> $Destination"
               if ($exitCode -le 7) {
                   Write-Ok "Copy finished: $Destination"
                   return $true
@@ -80,8 +93,7 @@ jobs:
           }
           '@
           $pattern = '(?s)function Copy-KnownFolderContent \{.*?\r?\n\}\r?\n\r?\nfunction Set-KnownFolderLayout'
-          if ($text -notmatch $pattern) { throw 'Copy-KnownFolderContent block not found' }
-          $text = [regex]::Replace($text, $pattern, $copyFunction + "`r`n`r`nfunction Set-KnownFolderLayout", 1)
+          $text = Replace-OnceLiteral -InputText $text -Pattern $pattern -Replacement ($copyFunction + "`r`n`r`nfunction Set-KnownFolderLayout")
 
           $wingetDownload = @'
           function Download-WingetInstaller {
@@ -101,7 +113,10 @@ jobs:
                   if ($selector.Architecture) { $arguments += @('--architecture', $Architecture) }
                   $arguments += @('--download-directory', $Destination, '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
                   Write-Info "WinGet download: $Id"
-                  & $WingetCommand @arguments
+                  & $WingetCommand @arguments 2>&1 | ForEach-Object {
+                      Write-Host $_
+                      Add-Log "winget: $_"
+                  }
                   $exitCode = $LASTEXITCODE
                   Add-Log "winget download $Id exit code: $exitCode"
                   if ($exitCode -eq 0) { break }
@@ -121,8 +136,7 @@ jobs:
           }
           '@
           $pattern = '(?s)function Download-WingetInstaller \{.*?\r?\n\}\r?\n\r?\nfunction Quote-Argument'
-          if ($text -notmatch $pattern) { throw 'Download-WingetInstaller block not found' }
-          $text = [regex]::Replace($text, $pattern, $wingetDownload + "`r`n`r`nfunction Quote-Argument", 1)
+          $text = Replace-OnceLiteral -InputText $text -Pattern $pattern -Replacement ($wingetDownload + "`r`n`r`nfunction Quote-Argument")
 
           $componentSelection = @'
           function Select-Components {
@@ -179,8 +193,7 @@ jobs:
           }
           '@
           $pattern = '(?s)function Select-Components \{.*?\r?\n\}\r?\n\r?\nfunction Show-Plan'
-          if ($text -notmatch $pattern) { throw 'Select-Components block not found' }
-          $text = [regex]::Replace($text, $pattern, $componentSelection + "`r`n`r`nfunction Show-Plan", 1)
+          $text = Replace-OnceLiteral -InputText $text -Pattern $pattern -Replacement ($componentSelection + "`r`n`r`nfunction Show-Plan")
 
           $oldInstall = '    if (-not (Invoke-AppInstaller -Kind $Spec.Installer -InstallerPath $installerPath -Target $target)) { Write-Fail "$Name installer returned an error"; return ''INSTALLER_FAILED'' }'
           $newInstall = '    Write-Info "Installing $Name to $target..."' + "`r`n" + $oldInstall
